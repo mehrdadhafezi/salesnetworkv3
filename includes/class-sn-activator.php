@@ -491,6 +491,7 @@ class SN_Activator {
 			'sn_financial_auth_page_id' => [ 'title' => 'ورود تایید مالی', 'slug' => 'financial-login', 'shortcode' => '[sn_financial_auth]' ],
 			'sn_financial_panel_page_id' => [ 'title' => 'پنل تایید مالی', 'slug' => 'financial-approval', 'shortcode' => '[sn_financial_panel]' ],
 			'sn_invoice_page_id' => [ 'title' => 'فاکتور', 'slug' => 'invoice', 'shortcode' => '[sn_invoice_page]' ],
+			'sn_hr_panel_page_id' => [ 'title' => 'پنل منابع انسانی', 'slug' => 'hr-panel', 'shortcode' => '[sn_hr_panel]' ],
 		];
 	}
 
