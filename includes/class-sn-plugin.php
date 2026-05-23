@@ -147,6 +147,9 @@ class SN_Plugin
 		add_action('wp_ajax_sn_hr_payroll_generate', [$this, 'ajax_hr_payroll_generate']);
 		add_action('wp_ajax_sn_hr_payroll_approve', [$this, 'ajax_hr_payroll_approve']);
 		add_action('wp_ajax_sn_hr_payroll_mark_paid', [$this, 'ajax_hr_payroll_mark_paid']);
+		add_action('wp_ajax_sn_hr_backfill_employees', [$this, 'ajax_hr_backfill_employees']);
+		add_action('wp_ajax_sn_hr_seed_levels', [$this, 'ajax_hr_seed_levels']);
+		add_action('wp_ajax_sn_hr_diagnostics', [$this, 'ajax_hr_diagnostics']);
 
 		// Seller AJAX
 		add_action('wp_ajax_sn_save_customer_info',        [$this, 'ajax_save_customer_info']);
@@ -3477,6 +3480,25 @@ class SN_Plugin
 		if (! is_user_logged_in() || ! $this->sn_can_hr() || ! check_ajax_referer('sn_public', 'nonce', false)) { SN_Helpers::send_json(false, 'دسترسی غیرمجاز'); return false; }
 		return true;
 	}
+	public function ajax_hr_backfill_employees(): void
+	{
+		if (! $this->sn_hr_guard()) return;
+		SN_HR::backfill_employee_profiles();
+		SN_Helpers::send_json(true, 'بازسازی کارمندان انجام شد');
+	}
+	public function ajax_hr_seed_levels(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$defaults = ['کارآموز','کارشناس','ارشد','سرپرست','مدیر'];
+		$sort = 10;
+		foreach ($defaults as $title) {
+			$exists = (int) $wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_hr_levels WHERE title=%s LIMIT 1", $title));
+			if ($exists) { continue; }
+			$wpdb->insert($wpdb->prefix.'sn_hr_levels',['level_key'=>sanitize_title($title).'-'.time().'-'.wp_rand(10,99),'title'=>$title,'sort_order'=>$sort,'is_system'=>1,'is_active'=>1,'created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);
+			$sort += 10;
+		}
+		SN_Helpers::send_json(true, 'سطح‌های پیش‌فرض ایجاد/بررسی شدند');
+	}
 
 	public function ajax_hr_list_employees(): void
 	{
@@ -3488,7 +3510,7 @@ class SN_Plugin
 		if($q!==''){ $where .= " AND (p.full_name LIKE %s OR p.phone LIKE %s OR p.role_key LIKE %s)"; $like='%'.$wpdb->esc_like($q).'%'; array_push($args,$like,$like,$like); }
 		if($role!==''){ $where .= " AND p.role_key=%s"; $args[]=$role; }
 		if(in_array($employment,['training','contract'],true)){ $where .= " AND p.employment_status=%s"; $args[]=$employment; }
-		$sql="SELECT p.*, u.user_login, u.display_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
+		$sql="SELECT p.*, u.user_login, u.display_name, l.title AS level_title, parent.full_name AS parent_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id LEFT JOIN {$wpdb->prefix}sn_hr_levels l ON l.id=p.level_id LEFT JOIN {$wpdb->prefix}sn_hr_employee_profiles parent ON parent.user_id=p.parent_user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
 		$rows=$args?$wpdb->get_results($wpdb->prepare($sql,...$args),ARRAY_A):$wpdb->get_results($sql,ARRAY_A);
 		SN_Helpers::send_json(true,'',['items'=>$rows?:[]]);
 	}
@@ -3516,6 +3538,16 @@ class SN_Plugin
 	}
 	public function ajax_hr_commission_models(): void
 	{ if (! $this->sn_hr_guard()) return; global $wpdb; $rows=$wpdb->get_results("SELECT * FROM {$wpdb->prefix}sn_hr_commission_models ORDER BY id DESC LIMIT 500", ARRAY_A); SN_Helpers::send_json(true,'',['items'=>$rows?:[]]); }
+	public function ajax_hr_diagnostics(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$data = [
+			'employees' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_employee_profiles"),
+			'levels' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_levels"),
+			'models' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_commission_models"),
+		];
+		SN_Helpers::send_json(true, 'اطلاعات فنی', ['data' => $data]);
+	}
 	public function ajax_hr_save_commission_model(): void
 	{
 		if (! $this->sn_hr_guard()) return; global $wpdb; $id=absint($_POST['id']??0);
