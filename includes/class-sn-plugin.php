@@ -3492,6 +3492,7 @@ class SN_Plugin
 		if($role!==''){ $where .= " AND p.role_key=%s"; $args[]=$role; }
 		if(in_array($employment,['training','contract'],true)){ $where .= " AND p.employment_status=%s"; $args[]=$employment; }
 		$sql="SELECT p.*, u.user_login, u.display_name, lp.title AS level_title, pu.display_name AS parent_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id LEFT JOIN {$wpdb->prefix}sn_hr_levels lp ON lp.id=p.level_id LEFT JOIN {$wpdb->users} pu ON pu.ID=p.parent_user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
+		$sql="SELECT p.*, u.user_login, u.display_name, l.title AS level_title, parent.full_name AS parent_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id LEFT JOIN {$wpdb->prefix}sn_hr_levels l ON l.id=p.level_id LEFT JOIN {$wpdb->prefix}sn_hr_employee_profiles parent ON parent.user_id=p.parent_user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
 		$rows=$args?$wpdb->get_results($wpdb->prepare($sql,...$args),ARRAY_A):$wpdb->get_results($sql,ARRAY_A);
 		SN_Helpers::send_json(true,'',['items'=>$rows?:[]]);
 	}
@@ -3519,6 +3520,25 @@ class SN_Plugin
 	}
 	public function ajax_hr_commission_models(): void
 	{ if (! $this->sn_hr_guard()) return; global $wpdb; $rows=$wpdb->get_results("SELECT * FROM {$wpdb->prefix}sn_hr_commission_models ORDER BY id DESC LIMIT 500", ARRAY_A); SN_Helpers::send_json(true,'',['items'=>$rows?:[]]); }
+	public function ajax_hr_diagnostics(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$user = wp_get_current_user();
+		$data = [
+			'current_user_id' => get_current_user_id(),
+			'roles' => (array) ($user->roles ?? []),
+			'can_hr' => $this->sn_can_hr(),
+			'employee_profiles_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_employee_profiles"),
+			'levels_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_levels"),
+			'commission_models_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_commission_models"),
+			'users_by_role' => [
+				'sn_seller' => count(get_users(['role' => 'sn_seller', 'fields' => 'ID', 'number' => 5000])),
+				'sn_supervisor' => count(get_users(['role' => 'sn_supervisor', 'fields' => 'ID', 'number' => 5000])),
+				'sn_sales_manager' => count(get_users(['role' => 'sn_sales_manager', 'fields' => 'ID', 'number' => 5000])),
+			],
+		];
+		SN_Helpers::send_json(true, 'اطلاعات فنی', ['data' => $data, 'debug' => $this->sn_hr_debug_data('sn_hr_diagnostics')]);
+	}
 	public function ajax_hr_save_commission_model(): void
 	{
 		if (! $this->sn_hr_guard()) return; global $wpdb; $id=absint($_POST['id']??0);
