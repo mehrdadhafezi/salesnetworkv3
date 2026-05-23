@@ -342,17 +342,53 @@ class SN_Helpers
 		));
 	}
 
+
+	public static function public_request_token(?object $invoice): string
+	{
+		if (! $invoice || empty($invoice->id) || empty($invoice->invoice_code)) {
+			return '';
+		}
+		return hash_hmac('sha256', (string) $invoice->id . '|' . (string) $invoice->invoice_code, wp_salt('sn_public_token'));
+	}
+
+	public static function validate_public_invoice_access(?object $invoice, string $token): bool
+	{
+		$expected = self::public_request_token($invoice);
+		return $expected !== '' && $token !== '' && hash_equals($expected, $token);
+	}
+
+	public static function enforce_rate_limit(string $key, int $max, int $window): bool
+	{
+		$transient_key = 'sn_rl_' . md5($key);
+		$hits = (int) get_transient($transient_key);
+		if ($hits >= $max) {
+			return false;
+		}
+		set_transient($transient_key, $hits + 1, $window);
+		return true;
+	}
+
 	/** آپلود فایل فیش پرداخت */
 	public static function upload_receipt(array $file): string|false
 	{
 		if (! function_exists('wp_handle_upload')) {
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 		}
-		$allowed = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf'];
-		if (! in_array($file['type'], $allowed, true)) {
+		$allowed_ext = ['jpg','jpeg','png','gif','pdf'];
+		$allowed_mimes = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf'];
+		$size_limit = 5 * 1024 * 1024;
+		$name = sanitize_file_name((string) ($file['name'] ?? ''));
+		$ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+		if (! in_array($ext, $allowed_ext, true) || (int) ($file['size'] ?? 0) > $size_limit) {
 			return false;
 		}
-		$uploaded = wp_handle_upload($file, ['test_form' => false]);
+		$finfo = wp_check_filetype_and_ext((string) ($file['tmp_name'] ?? ''), $name);
+		$mime = (string) ($finfo['type'] ?? ($file['type'] ?? ''));
+		if (! in_array($mime, $allowed_mimes, true)) {
+			return false;
+		}
+		$file['name'] = $name;
+		$uploaded = wp_handle_upload($file, ['test_form' => false, 'mimes' => array_combine($allowed_ext, $allowed_mimes)]);
 		return $uploaded['url'] ?? false;
 	}
 }
