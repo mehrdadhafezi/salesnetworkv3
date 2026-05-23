@@ -2093,5 +2093,3 @@ body .sn-jalali-empty{
 #sn-hr-content .sn-field{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
 #sn-hr-content input,#sn-hr-content select{padding:6px 8px;border:1px solid #d1d5db;border-radius:6px}
 @media (max-width:768px){#sn-hr-content .sn-table{display:block;overflow:auto;white-space:nowrap}}
-
-.sn-hr-panel .sn-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}.sn-hr-panel .sn-tab{padding:8px 12px}.sn-hr-panel .sn-table-wrap{overflow:auto}.sn-hr-panel input,.sn-hr-panel select{min-width:90px}.sn-hr-panel .sn-btn{padding:6px 10px}

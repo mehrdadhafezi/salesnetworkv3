@@ -3470,7 +3470,7 @@ class SN_Plugin
 		ob_start(); ?>
 		<div class="sn-hr-panel" dir="rtl">
 			<div class="sn-tabs"><button class="sn-tab active" data-tab="emp">کارمندان</button><button class="sn-tab" data-tab="levels">سمت‌ها و سطح‌ها</button><button class="sn-tab" data-tab="org">ساختار سازمانی</button><button class="sn-tab" data-tab="salary">حقوق ثابت</button><button class="sn-tab" data-tab="cm">مدل‌های پورسانت</button><button class="sn-tab" data-tab="tr">درخواست‌های جابجایی</button><button class="sn-tab" data-tab="ex">خروجی کامل کارمند</button><button class="sn-tab" data-tab="rep">گزارش حقوق و پورسانت</button></div>
-			<div id="sn-hr-content" class="sn-card">در حال بارگذاری...</div>
+			<div class="sn-card" id="sn-hr-diagnostics" style="margin-bottom:10px;display:none"></div><div id="sn-hr-content" class="sn-card">در حال بارگذاری...</div>
 		</div><?php
 		return ob_get_clean();
 	}
@@ -3479,50 +3479,6 @@ class SN_Plugin
 	{
 		if (! is_user_logged_in() || ! $this->sn_can_hr() || ! check_ajax_referer('sn_public', 'nonce', false)) { SN_Helpers::send_json(false, 'دسترسی غیرمجاز'); return false; }
 		return true;
-	}
-	private function sn_hr_debug_data(string $action, array $extra = []): array
-	{
-		global $wpdb;
-		$user = wp_get_current_user();
-		return array_merge([
-			'action' => $action,
-			'user_id' => get_current_user_id(),
-			'roles' => (array) ($user->roles ?? []),
-			'can_hr' => $this->sn_can_hr(),
-			'db_last_error' => (string) ($wpdb->last_error ?? ''),
-		], $extra);
-	}
-	public function ajax_hr_backfill_employees(): void
-	{
-		if (! $this->sn_hr_guard()) return; global $wpdb;
-		$roles = ['sn_seller', 'sn_supervisor', 'sn_sales_manager'];
-		$total_users = (int) count(get_users(['role__in' => $roles, 'number' => 5000, 'fields' => 'ID']));
-		if ($total_users < 1) {
-			$msg = 'هیچ کاربر فروشنده/سرپرست/مدیر فروشی برای ساخت پروفایل پیدا نشد.';
-			SN_Helpers::send_json(false, $msg, ['data' => ['inserted_count'=>0,'existing_count'=>0,'total_count'=>0], 'debug' => $this->sn_hr_debug_data('sn_hr_backfill_employees', ['inserted_count'=>0,'existing_count'=>0,'total_count'=>0])]);
-			return;
-		}
-		$counts = SN_HR::backfill_employee_profiles();
-		$msg = 'بازسازی کارمندان انجام شد. جدید: '.$counts['inserted_count'].' | موجود: '.$counts['existing_count'].' | کل: '.$counts['total_count'];
-		SN_Helpers::send_json(true, $msg, ['data' => $counts, 'debug' => $this->sn_hr_debug_data('sn_hr_backfill_employees', $counts + ['db_last_error'=>(string)$wpdb->last_error])]);
-	}
-	public function ajax_hr_seed_levels(): void
-	{
-		if (! $this->sn_hr_guard()) return; global $wpdb;
-		$defaults = ['کارآموز','کارشناس','ارشد','سرپرست','مدیر'];
-		$sort = 10;
-		$inserted_count = 0;
-		$existing_count = 0;
-		foreach ($defaults as $title) {
-			$exists = (int) $wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_hr_levels WHERE title=%s LIMIT 1", $title));
-			if ($exists) { $existing_count++; continue; }
-			$ok = $wpdb->insert($wpdb->prefix.'sn_hr_levels',['level_key'=>sanitize_title($title).'-'.time().'-'.wp_rand(10,99),'title'=>$title,'sort_order'=>$sort,'is_system'=>1,'is_active'=>1,'created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);
-			if ($ok) { $inserted_count++; }
-			$sort += 10;
-		}
-		$total_count = (int) count($defaults);
-		$msg = 'سطح‌های پیش‌فرض بررسی شد. جدید: '.$inserted_count.' | موجود: '.$existing_count.' | کل: '.$total_count;
-		SN_Helpers::send_json(true, $msg, ['data' => compact('inserted_count','existing_count','total_count'), 'debug' => $this->sn_hr_debug_data('sn_hr_seed_levels', compact('inserted_count','existing_count','total_count'))]);
 	}
 
 	public function ajax_hr_list_employees(): void
@@ -3535,6 +3491,7 @@ class SN_Plugin
 		if($q!==''){ $where .= " AND (p.full_name LIKE %s OR p.phone LIKE %s OR p.role_key LIKE %s)"; $like='%'.$wpdb->esc_like($q).'%'; array_push($args,$like,$like,$like); }
 		if($role!==''){ $where .= " AND p.role_key=%s"; $args[]=$role; }
 		if(in_array($employment,['training','contract'],true)){ $where .= " AND p.employment_status=%s"; $args[]=$employment; }
+		$sql="SELECT p.*, u.user_login, u.display_name, lp.title AS level_title, pu.display_name AS parent_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id LEFT JOIN {$wpdb->prefix}sn_hr_levels lp ON lp.id=p.level_id LEFT JOIN {$wpdb->users} pu ON pu.ID=p.parent_user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
 		$sql="SELECT p.*, u.user_login, u.display_name, l.title AS level_title, parent.full_name AS parent_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id LEFT JOIN {$wpdb->prefix}sn_hr_levels l ON l.id=p.level_id LEFT JOIN {$wpdb->prefix}sn_hr_employee_profiles parent ON parent.user_id=p.parent_user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
 		$rows=$args?$wpdb->get_results($wpdb->prepare($sql,...$args),ARRAY_A):$wpdb->get_results($sql,ARRAY_A);
 		SN_Helpers::send_json(true,'',['items'=>$rows?:[]]);
@@ -3789,6 +3746,30 @@ private function sn_hr_is_upstream_approver(array $req): bool
 	public function ajax_hr_payroll_mark_paid(): void
 	{
 		if (! $this->sn_hr_guard()) return; global $wpdb; $period=sanitize_text_field($_POST['period_key']??''); if(! $this->sn_valid_period($period)){SN_Helpers::send_json(false,'فرمت دوره نامعتبر است');return;} $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}sn_hr_salary_ledger SET status='paid', updated_at=%s WHERE period_key=%s AND status='approved'", current_time('mysql'), $period)); SN_Helpers::send_json(true,'حقوق دوره پرداخت‌شده ثبت شد');
+	}
+
+	public function ajax_hr_backfill_employees(): void
+	{
+		if (! $this->sn_hr_guard()) return;
+		if (class_exists('SN_HR')) { SN_HR::backfill_employee_profiles(); }
+		SN_Helpers::send_json(true, 'پروفایل کارمندان با موفقیت بازسازی شد');
+	}
+	public function ajax_hr_seed_levels(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$defaults=['کارآموز','کارشناس','ارشد','سرپرست','مدیر']; $added=0;
+		foreach($defaults as $i=>$t){
+			$exists=(int)$wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_hr_levels WHERE title=%s LIMIT 1",$t));
+			if($exists) continue;
+			$wpdb->insert($wpdb->prefix.'sn_hr_levels',['level_key'=>sanitize_title($t), 'title'=>$t,'sort_order'=>$i,'is_system'=>1,'is_active'=>1,'created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);
+			$added++;
+		}
+		SN_Helpers::send_json(true, $added ? 'سطوح پیش‌فرض ایجاد شد' : 'سطوح پیش‌فرض از قبل موجود هستند', ['added'=>$added]);
+	}
+	public function ajax_hr_diagnostics(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb; $u=wp_get_current_user();
+		SN_Helpers::send_json(true,'',['data'=>['user_id'=>$u->ID,'roles'=>array_values((array)$u->roles),'can_hr'=>$this->sn_can_hr(),'employee_count'=>(int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_employee_profiles"),'level_count'=>(int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_levels"),'model_count'=>(int)$wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_commission_models"),'nonce_present'=>!empty($_POST['nonce'])]]);
 	}
 
 	// =========================================================
