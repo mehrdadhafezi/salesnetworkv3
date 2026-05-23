@@ -43,6 +43,11 @@ require_once SN_PLUGIN_DIR . 'includes/class-sn-activator.php';
 require_once SN_PLUGIN_DIR . 'includes/class-sn-helpers.php';
 require_once SN_PLUGIN_DIR . 'includes/class-sn-sms.php';
 require_once SN_PLUGIN_DIR . 'includes/class-sn-invoice.php';
+require_once SN_PLUGIN_DIR . 'includes/class-sn-migration-manager.php';
+require_once SN_PLUGIN_DIR . 'includes/class-sn-invoice-state-machine.php';
+require_once SN_PLUGIN_DIR . 'includes/class-sn-hr.php';
+require_once SN_PLUGIN_DIR . 'includes/class-sn-hr-commission.php';
+require_once SN_PLUGIN_DIR . 'includes/class-sn-hr-transfers.php';
 require_once SN_PLUGIN_DIR . 'includes/class-sn-plugin.php';
 
 register_activation_hook( __FILE__, [ 'SN_Activator', 'activate' ] );

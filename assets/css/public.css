@@ -2080,3 +2080,16 @@ body .sn-jalali-empty{
   visibility:hidden;
   pointer-events:none;
 }
+
+
+/* HR Panel */
+.sn-hr-panel{direction:rtl}
+.sn-hr-panel .sn-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+.sn-hr-panel .sn-tab{border:1px solid #d1d5db;background:#fff;padding:8px 12px;border-radius:8px;cursor:pointer}
+.sn-hr-panel .sn-tab.active{background:#2563eb;color:#fff;border-color:#2563eb}
+#sn-hr-content{min-height:140px}
+#sn-hr-content .sn-table{width:100%;border-collapse:collapse}
+#sn-hr-content .sn-table th,#sn-hr-content .sn-table td{border:1px solid #e5e7eb;padding:8px;text-align:right;vertical-align:top}
+#sn-hr-content .sn-field{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+#sn-hr-content input,#sn-hr-content select{padding:6px 8px;border:1px solid #d1d5db;border-radius:6px}
+@media (max-width:768px){#sn-hr-content .sn-table{display:block;overflow:auto;white-space:nowrap}}
