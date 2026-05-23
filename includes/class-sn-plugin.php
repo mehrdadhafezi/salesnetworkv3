@@ -147,6 +147,9 @@ class SN_Plugin
 		add_action('wp_ajax_sn_hr_payroll_generate', [$this, 'ajax_hr_payroll_generate']);
 		add_action('wp_ajax_sn_hr_payroll_approve', [$this, 'ajax_hr_payroll_approve']);
 		add_action('wp_ajax_sn_hr_payroll_mark_paid', [$this, 'ajax_hr_payroll_mark_paid']);
+		add_action('wp_ajax_sn_hr_backfill_employees', [$this, 'ajax_hr_backfill_employees']);
+		add_action('wp_ajax_sn_hr_seed_levels', [$this, 'ajax_hr_seed_levels']);
+		add_action('wp_ajax_sn_hr_diagnostics', [$this, 'ajax_hr_diagnostics']);
 
 		// Seller AJAX
 		add_action('wp_ajax_sn_save_customer_info',        [$this, 'ajax_save_customer_info']);
@@ -3477,6 +3480,50 @@ class SN_Plugin
 		if (! is_user_logged_in() || ! $this->sn_can_hr() || ! check_ajax_referer('sn_public', 'nonce', false)) { SN_Helpers::send_json(false, 'دسترسی غیرمجاز'); return false; }
 		return true;
 	}
+	private function sn_hr_debug_data(string $action, array $extra = []): array
+	{
+		global $wpdb;
+		$user = wp_get_current_user();
+		return array_merge([
+			'action' => $action,
+			'user_id' => get_current_user_id(),
+			'roles' => (array) ($user->roles ?? []),
+			'can_hr' => $this->sn_can_hr(),
+			'db_last_error' => (string) ($wpdb->last_error ?? ''),
+		], $extra);
+	}
+	public function ajax_hr_backfill_employees(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$roles = ['sn_seller', 'sn_supervisor', 'sn_sales_manager'];
+		$total_users = (int) count(get_users(['role__in' => $roles, 'number' => 5000, 'fields' => 'ID']));
+		if ($total_users < 1) {
+			$msg = 'هیچ کاربر فروشنده/سرپرست/مدیر فروشی برای ساخت پروفایل پیدا نشد.';
+			SN_Helpers::send_json(false, $msg, ['data' => ['inserted_count'=>0,'existing_count'=>0,'total_count'=>0], 'debug' => $this->sn_hr_debug_data('sn_hr_backfill_employees', ['inserted_count'=>0,'existing_count'=>0,'total_count'=>0])]);
+			return;
+		}
+		$counts = SN_HR::backfill_employee_profiles();
+		$msg = 'بازسازی کارمندان انجام شد. جدید: '.$counts['inserted_count'].' | موجود: '.$counts['existing_count'].' | کل: '.$counts['total_count'];
+		SN_Helpers::send_json(true, $msg, ['data' => $counts, 'debug' => $this->sn_hr_debug_data('sn_hr_backfill_employees', $counts + ['db_last_error'=>(string)$wpdb->last_error])]);
+	}
+	public function ajax_hr_seed_levels(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$defaults = ['کارآموز','کارشناس','ارشد','سرپرست','مدیر'];
+		$sort = 10;
+		$inserted_count = 0;
+		$existing_count = 0;
+		foreach ($defaults as $title) {
+			$exists = (int) $wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_hr_levels WHERE title=%s LIMIT 1", $title));
+			if ($exists) { $existing_count++; continue; }
+			$ok = $wpdb->insert($wpdb->prefix.'sn_hr_levels',['level_key'=>sanitize_title($title).'-'.time().'-'.wp_rand(10,99),'title'=>$title,'sort_order'=>$sort,'is_system'=>1,'is_active'=>1,'created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);
+			if ($ok) { $inserted_count++; }
+			$sort += 10;
+		}
+		$total_count = (int) count($defaults);
+		$msg = 'سطح‌های پیش‌فرض بررسی شد. جدید: '.$inserted_count.' | موجود: '.$existing_count.' | کل: '.$total_count;
+		SN_Helpers::send_json(true, $msg, ['data' => compact('inserted_count','existing_count','total_count'), 'debug' => $this->sn_hr_debug_data('sn_hr_seed_levels', compact('inserted_count','existing_count','total_count'))]);
+	}
 
 	public function ajax_hr_list_employees(): void
 	{
@@ -3488,7 +3535,7 @@ class SN_Plugin
 		if($q!==''){ $where .= " AND (p.full_name LIKE %s OR p.phone LIKE %s OR p.role_key LIKE %s)"; $like='%'.$wpdb->esc_like($q).'%'; array_push($args,$like,$like,$like); }
 		if($role!==''){ $where .= " AND p.role_key=%s"; $args[]=$role; }
 		if(in_array($employment,['training','contract'],true)){ $where .= " AND p.employment_status=%s"; $args[]=$employment; }
-		$sql="SELECT p.*, u.user_login, u.display_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
+		$sql="SELECT p.*, u.user_login, u.display_name, l.title AS level_title, parent.full_name AS parent_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id LEFT JOIN {$wpdb->prefix}sn_hr_levels l ON l.id=p.level_id LEFT JOIN {$wpdb->prefix}sn_hr_employee_profiles parent ON parent.user_id=p.parent_user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
 		$rows=$args?$wpdb->get_results($wpdb->prepare($sql,...$args),ARRAY_A):$wpdb->get_results($sql,ARRAY_A);
 		SN_Helpers::send_json(true,'',['items'=>$rows?:[]]);
 	}
@@ -3516,6 +3563,25 @@ class SN_Plugin
 	}
 	public function ajax_hr_commission_models(): void
 	{ if (! $this->sn_hr_guard()) return; global $wpdb; $rows=$wpdb->get_results("SELECT * FROM {$wpdb->prefix}sn_hr_commission_models ORDER BY id DESC LIMIT 500", ARRAY_A); SN_Helpers::send_json(true,'',['items'=>$rows?:[]]); }
+	public function ajax_hr_diagnostics(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$user = wp_get_current_user();
+		$data = [
+			'current_user_id' => get_current_user_id(),
+			'roles' => (array) ($user->roles ?? []),
+			'can_hr' => $this->sn_can_hr(),
+			'employee_profiles_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_employee_profiles"),
+			'levels_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_levels"),
+			'commission_models_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_commission_models"),
+			'users_by_role' => [
+				'sn_seller' => count(get_users(['role' => 'sn_seller', 'fields' => 'ID', 'number' => 5000])),
+				'sn_supervisor' => count(get_users(['role' => 'sn_supervisor', 'fields' => 'ID', 'number' => 5000])),
+				'sn_sales_manager' => count(get_users(['role' => 'sn_sales_manager', 'fields' => 'ID', 'number' => 5000])),
+			],
+		];
+		SN_Helpers::send_json(true, 'اطلاعات فنی', ['data' => $data, 'debug' => $this->sn_hr_debug_data('sn_hr_diagnostics')]);
+	}
 	public function ajax_hr_save_commission_model(): void
 	{
 		if (! $this->sn_hr_guard()) return; global $wpdb; $id=absint($_POST['id']??0);
