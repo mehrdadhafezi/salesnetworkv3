@@ -14,17 +14,85 @@ class SN_Plugin
 		return SN_VERSION . '-' . $mtime;
 	}
 
+
+	private function sn_stats_definitions(): array
+	{
+		return [
+			// لید کل: تمام رکوردهای جدول لید.
+			'lead_total' => "1=1",
+			// لید تخصیص‌یافته: لیدی که فروشنده دارد.
+			'lead_assigned' => "seller_id IS NOT NULL",
+			// لید فعال: لیدی که هنوز تبدیل/بسته نشده است.
+			'lead_active' => "status IN ('assigned','supervisor_pool','unassigned')",
+			// لید تکمیل‌شده: لید تبدیل‌شده به فروش.
+			'lead_completed' => "status='invoiced'",
+			// فاکتور صادرشده: هر فاکتور ثبت‌شده.
+			'invoice_issued' => "1=1",
+			// پرداخت در انتظار بررسی مالی.
+			'payment_pending_review' => "(status IN ('pending_financial_approval','receipt_uploaded') OR payment_status IN ('pending_financial_approval','receipt_uploaded') OR invoice_status IN ('pending_financial_approval','receipt_uploaded'))",
+			// پرداخت تأییدشده مالی.
+			'payment_financial_approved' => "(status IN ('approved','finance_approved','completed') OR payment_status='approved' OR invoice_status='approved' OR financial_return_state='approved')",
+			// پرداخت ردشده مالی.
+			'payment_financial_rejected' => "(status IN ('rejected','finance_rejected') OR payment_status='rejected' OR invoice_status='rejected' OR financial_return_state='rejected')",
+			// فاکتور برگشتی به فروشنده.
+			'invoice_returned_to_seller' => "financial_return_state='returned_to_seller'",
+			// ووچر خریداری‌شده: فاکتور پرداخت‌شده/تاییدشده.
+			'voucher_purchased' => "(status IN ('paid','approved','finance_approved','completed') OR payment_status='approved' OR invoice_status='approved')",
+			// ووچر استفاده‌شده: فعلاً completed را استفاده‌شده درنظر می‌گیریم.
+			'voucher_used' => "status='completed'",
+		];
+	}
+
+	private function sn_count_metric(string $entity, string $metric, array $extra_where = [], array $params = []): int
+	{
+		global $wpdb;
+		$defs = $this->sn_stats_definitions();
+		$base = $defs[$metric] ?? '1=0';
+		$table = $entity === 'lead' ? "{$wpdb->prefix}sn_leads" : "{$wpdb->prefix}sn_invoices";
+		$where = array_merge([$base], $extra_where);
+		$sql = "SELECT COUNT(*) FROM {$table} WHERE " . implode(' AND ', array_map(fn($w)=>"($w)", $where));
+		return (int) ($params ? $wpdb->get_var($wpdb->prepare($sql, ...$params)) : $wpdb->get_var($sql));
+	}
+
+	private function sn_sum_metric_amount(string $metric, array $extra_where = [], array $params = []): float
+	{
+		global $wpdb;
+		$defs = $this->sn_stats_definitions();
+		$base = $defs[$metric] ?? '1=0';
+		$where = array_merge([$base], $extra_where);
+		$sql = "SELECT COALESCE(SUM(COALESCE(final_total, product_price, 0)),0) FROM {$wpdb->prefix}sn_invoices WHERE " . implode(' AND ', array_map(fn($w)=>"($w)", $where));
+		return (float) ($params ? $wpdb->get_var($wpdb->prepare($sql, ...$params)) : $wpdb->get_var($sql));
+	}
+
+	private function sn_commission_metrics(): array
+	{
+		global $wpdb;
+		$payable = (float) $wpdb->get_var("SELECT COALESCE(SUM(amount),0) FROM {$wpdb->prefix}sn_wallet_transactions WHERE direction='credit' AND type IN ('seller_commission','supervisor_commission')");
+		$paid = (float) $wpdb->get_var("SELECT COALESCE(SUM(amount),0) FROM {$wpdb->prefix}sn_wallet_transactions WHERE direction='debit' AND type='settlement'");
+		return ['commission_payable' => $payable, 'commission_paid' => $paid];
+	}
+
+	private function sn_report_status_debug_counts(): array
+	{
+		global $wpdb;
+		return [
+			'status' => $wpdb->get_results("SELECT status AS label, COUNT(*) AS cnt FROM {$wpdb->prefix}sn_invoices GROUP BY status ORDER BY cnt DESC", ARRAY_A),
+			'invoice_status' => $wpdb->get_results("SELECT COALESCE(invoice_status,'(null)') AS label, COUNT(*) AS cnt FROM {$wpdb->prefix}sn_invoices GROUP BY invoice_status ORDER BY cnt DESC", ARRAY_A),
+			'payment_status' => $wpdb->get_results("SELECT COALESCE(payment_status,'(null)') AS label, COUNT(*) AS cnt FROM {$wpdb->prefix}sn_invoices GROUP BY payment_status ORDER BY cnt DESC", ARRAY_A),
+			'financial_return_state' => $wpdb->get_results("SELECT COALESCE(financial_return_state,'(null)') AS label, COUNT(*) AS cnt FROM {$wpdb->prefix}sn_invoices GROUP BY financial_return_state ORDER BY cnt DESC", ARRAY_A),
+		];
+	}
+
 	public function run(): void
 	{
 		// غیرفعال کردن jwt در AJAX های پلاگین ما — باید priority 1 باشه
 		add_action('init', [$this, 'disable_jwt_on_ajax'], 1);
 
 		add_action('init',                [$this, 'register_shortcodes']);
-		add_action('init',                [$this, 'ensure_required_pages'], 2);
 		add_action('admin_menu',          [$this, 'register_admin_menu']);
 		add_action('wp_enqueue_scripts',  [$this, 'enqueue_public_assets']);
 		add_action('admin_enqueue_scripts', [$this, 'enqueue_admin_assets']);
-		add_action('admin_init',            [$this, 'maybe_create_tables']);
+		add_action('admin_init',            ['SN_Migration_Manager', 'maybe_run']);
 		add_action('admin_init',            [$this, 'handle_admin_export']);
 		add_action('admin_init',            [$this, 'block_front_roles_admin_access'], 1);
 		add_action('after_setup_theme',     [$this, 'hide_front_roles_admin_bar'], 1);
@@ -33,6 +101,7 @@ class SN_Plugin
 		add_action('init',                  [$this, 'ensure_after_sales_role'], 5);
 		add_action('init',                  [$this, 'ensure_sales_manager_role'], 5);
 		add_action('init',                  [$this, 'ensure_wallet_tables'], 6);
+		add_action('init',                  [$this, 'ensure_hr_role'], 7);
 		add_action('wp_enqueue_scripts',    [$this, 'dequeue_external_fonts'], 99);
 		add_filter('http_request_host_is_external', [$this, 'allow_sales_network_payment_sms_hosts'], 10, 3);
 
@@ -64,20 +133,30 @@ class SN_Plugin
 		add_action('wp_ajax_sn_repair_pages',      [$this, 'ajax_repair_pages']);
 		add_action('wp_ajax_sn_wallet_manual_adjust', [$this, 'ajax_wallet_manual_adjust']);
 		add_action('wp_ajax_sn_wallet_recalculate', [$this, 'ajax_wallet_recalculate']);
+		add_action('wp_ajax_sn_hr_list_employees', [$this, 'ajax_hr_list_employees']);
+		add_action('wp_ajax_sn_hr_update_employee', [$this, 'ajax_hr_update_employee']);
+		add_action('wp_ajax_sn_hr_levels', [$this, 'ajax_hr_levels']);
+		add_action('wp_ajax_sn_hr_save_level', [$this, 'ajax_hr_save_level']);
+		add_action('wp_ajax_sn_hr_commission_models', [$this, 'ajax_hr_commission_models']);
+		add_action('wp_ajax_sn_hr_save_commission_model', [$this, 'ajax_hr_save_commission_model']);
+		add_action('wp_ajax_sn_hr_transfer_create', [$this, 'ajax_hr_transfer_create']);
+		add_action('wp_ajax_sn_hr_transfer_list', [$this, 'ajax_hr_transfer_list']);
+		add_action('wp_ajax_sn_hr_transfer_action', [$this, 'ajax_hr_transfer_action']);
+		add_action('wp_ajax_sn_hr_employee_export', [$this, 'ajax_hr_employee_export']);
+		add_action('wp_ajax_sn_hr_payroll_preview', [$this, 'ajax_hr_payroll_preview']);
+		add_action('wp_ajax_sn_hr_payroll_generate', [$this, 'ajax_hr_payroll_generate']);
+		add_action('wp_ajax_sn_hr_payroll_approve', [$this, 'ajax_hr_payroll_approve']);
+		add_action('wp_ajax_sn_hr_payroll_mark_paid', [$this, 'ajax_hr_payroll_mark_paid']);
 
 		// Seller AJAX
 		add_action('wp_ajax_sn_save_customer_info',        [$this, 'ajax_save_customer_info']);
-		add_action('wp_ajax_nopriv_sn_save_customer_info', [$this, 'ajax_save_customer_info']);
 		add_action('wp_ajax_sn_toggle_seller_active',      [$this, 'ajax_toggle_seller_active']);
 		add_action('wp_ajax_sn_create_invoice',        [$this, 'ajax_create_invoice']);
-		add_action('wp_ajax_nopriv_sn_create_invoice', [$this, 'ajax_create_invoice']);
 		// fallback: form POST برای محیط‌هایی که AJAX خراب میشه
 		add_action('admin_post_sn_create_invoice',        [$this, 'handle_create_invoice_post']);
 		add_action('admin_post_nopriv_sn_create_invoice', [$this, 'handle_create_invoice_post']);
 		add_action('wp_ajax_sn_seller_leads',        [$this, 'ajax_seller_leads']);
-		add_action('wp_ajax_nopriv_sn_seller_leads', [$this, 'ajax_seller_leads']);
 		add_action('wp_ajax_sn_seller_invoices',        [$this, 'ajax_seller_invoices']);
-		add_action('wp_ajax_nopriv_sn_seller_invoices', [$this, 'ajax_seller_invoices']);
 
 		// Supervisor AJAX
 		add_action('wp_ajax_sn_supervisor_data',   [$this, 'ajax_supervisor_data']);
@@ -97,6 +176,7 @@ class SN_Plugin
 		add_action('wp_ajax_sn_financial_reject_payment', [$this, 'ajax_financial_reject_payment']);
 		add_action('wp_ajax_sn_financial_invoices', [$this, 'ajax_financial_invoices']);
 		add_action('wp_ajax_sn_seller_resend_financial', [$this, 'ajax_seller_resend_financial']);
+		add_action('wp_ajax_sn_invoice_logs', [$this, 'ajax_invoice_logs']);
 
 		// Public (no login) - صفحه فاکتور مشتری
 		add_action('wp_ajax_nopriv_sn_invoice_info',    [$this, 'ajax_invoice_info']);
@@ -158,22 +238,14 @@ class SN_Plugin
 
 		// وضعیت lead
 		add_action('wp_ajax_sn_update_lead_status',       [$this, 'ajax_update_lead_status']);
-		add_action('wp_ajax_nopriv_sn_update_lead_status', [$this, 'ajax_update_lead_status']);
 		add_action('wp_ajax_sn_get_lead_statuses',          [$this, 'ajax_get_lead_statuses']);
-		add_action('wp_ajax_nopriv_sn_get_lead_statuses',   [$this, 'ajax_get_lead_statuses']); // فروشنده login شده
 		add_action('wp_ajax_sn_save_statuses',      [$this, 'ajax_save_statuses']);
 	}
 
 
 	public function ensure_required_pages(): void
 	{
-		if (! is_admin() && get_option('sn_pages_repair_version') === SN_VERSION) {
-			return;
-		}
-		if (class_exists('SN_Activator') && method_exists('SN_Activator', 'create_required_pages')) {
-			SN_Activator::create_required_pages();
-			update_option('sn_pages_repair_version', SN_VERSION);
-		}
+		// intentionally no-op: pages must be created by explicit admin action.
 	}
 
 	// =========================================================
@@ -192,6 +264,7 @@ class SN_Plugin
 		add_shortcode('sn_invoice_page',     [$this, 'render_invoice_page']);
 		add_shortcode('sn_auth',             [$this, 'render_auth']);
 		add_shortcode('sn_supervisor_auth',  [$this, 'render_supervisor_auth']);
+		add_shortcode('sn_hr_panel', [$this, 'render_hr_panel']);
 	}
 
 	// =========================================================
@@ -213,6 +286,7 @@ class SN_Plugin
 			'sn_supervisor_auth'     => 'auth',
 			'sn_sales_manager_auth'  => 'auth',
 			'sn_financial_auth'      => 'auth',
+			'sn_hr_panel'            => 'hr',
 		];
 
 		$asset_key = '';
@@ -245,6 +319,7 @@ class SN_Plugin
 			'manager'    => 'public-manager.js',
 			'invoice'    => 'public-invoice.js',
 			'auth'       => 'public-auth.js',
+			'hr'         => 'public-hr.js',
 		];
 		$script_file = $script_map[$asset_key] ?? 'public-auth.js';
 		$handle = 'sn-public-' . $asset_key;
@@ -2262,6 +2337,7 @@ class SN_Plugin
 			$lead['has_recontact'] = ! empty($lead['has_recontact']);
 		}
 		unset($lead);
+		$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
 		SN_Helpers::send_json(true, '', ['leads' => $leads]);
 	}
 
@@ -2395,10 +2471,11 @@ class SN_Plugin
 		$range_count = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_leads {$range_sql}", ...$args));
 		$total_count = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_leads WHERE supervisor_id=%d", $supervisor_id));
 		$assigned_count = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_leads WHERE supervisor_id=%d AND seller_id IS NOT NULL", $supervisor_id));
-		$invoiced_count = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_leads WHERE supervisor_id=%d AND status='invoiced'", $supervisor_id));
-		$paid_count = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_invoices i INNER JOIN {$wpdb->prefix}sn_leads l ON l.id=i.lead_id WHERE l.supervisor_id=%d AND i.status IN ('paid','approved')", $supervisor_id));
+		$invoiced_count = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_leads WHERE supervisor_id=%d AND (" . ($this->sn_stats_definitions()['lead_completed']) . ")", $supervisor_id));
+		$paid_count = $this->sn_count_metric('invoice','payment_financial_approved',["supervisor_id=%d"],[$supervisor_id]);
 		$lead_statuses = $wpdb->get_col("SELECT label FROM {$wpdb->prefix}sn_lead_statuses WHERE is_active=1 ORDER BY sort_order ASC, id ASC");
 
+		$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
 		SN_Helpers::send_json(true, '', [
 			'sellers' => $sellers_data,
 			'unassigned' => $pool,
@@ -2417,18 +2494,47 @@ class SN_Plugin
 		]);
 	}
 
+
+	private function sn_public_error(string $message, string $code = 'sn_public_error', int $http = 400): void
+	{
+		wp_send_json(['success' => false, 'code' => $code, 'message' => $message], $http);
+	}
+
+	private function guard_public_invoice_request(string $method = 'POST')
+	{
+		if (strtoupper((string) ($_SERVER['REQUEST_METHOD'] ?? 'GET')) !== strtoupper($method)) {
+			$this->sn_public_error('متد درخواست نامعتبر است', 'invalid_method', 405);
+			return null;
+		}
+		if (! check_ajax_referer('sn_public', 'nonce', false)) {
+			$this->sn_public_error('نشست منقضی شده است. صفحه را رفرش کنید.', 'invalid_nonce', 403);
+			return null;
+		}
+		$code = sanitize_text_field(wp_unslash($_POST['invoice_code'] ?? ''));
+		$invoice = SN_Helpers::get_invoice_by_code($code);
+		$token = sanitize_text_field(wp_unslash($_POST['public_token'] ?? ''));
+		if (! $invoice || ! SN_Helpers::validate_public_invoice_access($invoice, $token)) {
+			$this->sn_public_error('دسترسی به فاکتور مجاز نیست.', 'forbidden_invoice', 403);
+			return null;
+		}
+		$ip = sanitize_text_field($_SERVER['REMOTE_ADDR'] ?? 'na');
+		if (! SN_Helpers::enforce_rate_limit('pub|' . $code . '|' . $ip, 20, 60)) {
+			$this->sn_public_error('تعداد درخواست بیش از حد مجاز است. لطفا کمی بعد تلاش کنید.', 'rate_limited', 429);
+			return null;
+		}
+		return $invoice;
+	}
+
 	// =========================================================
 	// AJAX - INVOICE PAGE (PUBLIC)
 	// =========================================================
 
 	public function ajax_invoice_info(): void
 	{
-		if (! check_ajax_referer('sn_public', 'nonce', false)) {
-			SN_Helpers::send_json(false, 'نانس نامعتبر');
+		$invoice = $this->guard_public_invoice_request('POST');
+		if (! $invoice) {
 			return;
 		}
-		$code    = sanitize_text_field(wp_unslash($_POST['invoice_code'] ?? ''));
-		$invoice = SN_Helpers::get_invoice_by_code($code);
 		if (! $invoice) {
 			SN_Helpers::send_json(false, 'فاکتور یافت نشد');
 			return;
@@ -2506,6 +2612,7 @@ class SN_Plugin
 		if (isset($invoice->coupon_discount_amount)) { $discount_total = max($discount_total, (float) $invoice->coupon_discount_amount + (float)($invoice->discount_amount ?? 0)); }
 		$wheel_used = (int) $wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_invoice_wheel WHERE invoice_id=%d", (int) $invoice->id));
 
+		$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
 		SN_Helpers::send_json(true, '', [
 			'invoice' => [
 				'id'             => $invoice->id,
@@ -2535,6 +2642,7 @@ class SN_Plugin
 				'is_paid'        => in_array((string) $invoice->status, ['paid','approved'], true),
 			],
 			'card'    => ['number' => $card_number, 'owner' => $card_owner],
+			'logs' => $timeline,
 			'settings' => [
 				'wheel_company_name' => get_option('sn_wheel_company_name', ''),
 				'lottery_text_template' => get_option('sn_lottery_text_template', 'با پرداخت این فاکتور {count} شانس برای شرکت در قرعه‌کشی {company} دریافت می‌کنید.'),
@@ -2558,12 +2666,10 @@ class SN_Plugin
 
 	public function ajax_pay_online(): void
 	{
-		if (! check_ajax_referer('sn_public', 'nonce', false)) {
-			SN_Helpers::send_json(false, 'نانس نامعتبر');
+		$invoice = $this->guard_public_invoice_request('POST');
+		if (! $invoice) {
 			return;
 		}
-		$code    = sanitize_text_field(wp_unslash($_POST['invoice_code'] ?? ''));
-		$invoice = SN_Helpers::get_invoice_by_code($code);
 		if (! $invoice || ! in_array($invoice->status, ['pending', 'pre_invoice'], true)) {
 			SN_Helpers::send_json(false, 'فاکتور نامعتبر یا قبلاً پرداخت شده');
 			return;
@@ -2589,17 +2695,16 @@ class SN_Plugin
 			return;
 		}
 
+		$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
 		SN_Helpers::send_json(true, '', ['redirect' => $result['url']]);
 	}
 
 	public function ajax_upload_receipt(): void
 	{
-		if (! check_ajax_referer('sn_public', 'nonce', false)) {
-			SN_Helpers::send_json(false, 'نانس نامعتبر');
+		$invoice = $this->guard_public_invoice_request('POST');
+		if (! $invoice) {
 			return;
 		}
-		$code    = sanitize_text_field(wp_unslash($_POST['invoice_code'] ?? ''));
-		$invoice = SN_Helpers::get_invoice_by_code($code);
 		$allowed = ['pending', 'pre_invoice', 'rejected', 'pending_payment', 'receipt_uploaded', 'pending_financial_approval'];
 		if (! $invoice || ! in_array((string) $invoice->status, $allowed, true)) {
 			SN_Helpers::send_json(false, 'این فاکتور در وضعیت قابل ثبت فیش نیست');
@@ -3344,6 +3449,282 @@ class SN_Plugin
 		return ob_get_clean();
 	}
 
+	private function sn_can_hr(): bool
+	{
+		return current_user_can('manage_options') || current_user_can('sn_hr_manage') || current_user_can('sn_hr');
+	}
+
+	public function ensure_hr_role(): void
+	{
+		if (! get_role('sn_hr')) {
+			add_role('sn_hr', 'منابع انسانی', ['read' => true, 'sn_hr_manage' => true, 'sn_hr' => true]);
+		}
+	}
+
+	public function render_hr_panel(): string
+	{
+		if (! is_user_logged_in() || ! $this->sn_can_hr()) { return '<div class="sn-card" dir="rtl">دسترسی غیرمجاز</div>'; }
+		ob_start(); ?>
+		<div class="sn-hr-panel" dir="rtl">
+			<div class="sn-tabs"><button class="sn-tab active" data-tab="emp">کارمندان</button><button class="sn-tab" data-tab="levels">سمت‌ها و سطح‌ها</button><button class="sn-tab" data-tab="org">ساختار سازمانی</button><button class="sn-tab" data-tab="salary">حقوق ثابت</button><button class="sn-tab" data-tab="cm">مدل‌های پورسانت</button><button class="sn-tab" data-tab="tr">درخواست‌های جابجایی</button><button class="sn-tab" data-tab="ex">خروجی کامل کارمند</button><button class="sn-tab" data-tab="rep">گزارش حقوق و پورسانت</button></div>
+			<div id="sn-hr-content" class="sn-card">در حال بارگذاری...</div>
+		</div><?php
+		return ob_get_clean();
+	}
+
+	private function sn_hr_guard(): bool
+	{
+		if (! is_user_logged_in() || ! $this->sn_can_hr() || ! check_ajax_referer('sn_public', 'nonce', false)) { SN_Helpers::send_json(false, 'دسترسی غیرمجاز'); return false; }
+		return true;
+	}
+
+	public function ajax_hr_list_employees(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$q = sanitize_text_field(wp_unslash($_POST['q'] ?? ''));
+		$role = sanitize_key($_POST['role_key'] ?? '');
+		$employment = sanitize_key($_POST['employment_status'] ?? '');
+		$where='1=1'; $args=[];
+		if($q!==''){ $where .= " AND (p.full_name LIKE %s OR p.phone LIKE %s OR p.role_key LIKE %s)"; $like='%'.$wpdb->esc_like($q).'%'; array_push($args,$like,$like,$like); }
+		if($role!==''){ $where .= " AND p.role_key=%s"; $args[]=$role; }
+		if(in_array($employment,['training','contract'],true)){ $where .= " AND p.employment_status=%s"; $args[]=$employment; }
+		$sql="SELECT p.*, u.user_login, u.display_name FROM {$wpdb->prefix}sn_hr_employee_profiles p LEFT JOIN {$wpdb->users} u ON u.ID=p.user_id WHERE {$where} ORDER BY p.id DESC LIMIT 300";
+		$rows=$args?$wpdb->get_results($wpdb->prepare($sql,...$args),ARRAY_A):$wpdb->get_results($sql,ARRAY_A);
+		SN_Helpers::send_json(true,'',['items'=>$rows?:[]]);
+	}
+	public function ajax_hr_update_employee(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$id=absint($_POST['id']??0); if(!$id){SN_Helpers::send_json(false,'شناسه نامعتبر');return;}
+		$row=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE id=%d",$id)); if(!$row){SN_Helpers::send_json(false,'کارمند یافت نشد');return;}
+		$target=get_user_by('id',(int)$row->user_id); if($target && in_array('administrator',(array)$target->roles,true) && ! current_user_can('manage_options')){SN_Helpers::send_json(false,'ویرایش ادمین مجاز نیست');return;}
+		$data=['role_key'=>sanitize_key($_POST['role_key']??$row->role_key),'level_id'=>absint($_POST['level_id']??0)?:null,'parent_user_id'=>absint($_POST['parent_user_id']??0)?:null,'base_salary'=>(float)($_POST['base_salary']??$row->base_salary),'employment_status'=>in_array($_POST['employment_status']??'', ['training','contract'],true)?sanitize_key($_POST['employment_status']):$row->employment_status,'is_active'=>!empty($_POST['is_active'])?1:0,'updated_at'=>current_time('mysql')]
+		;
+		$wpdb->update($wpdb->prefix.'sn_hr_employee_profiles',$data,['id'=>$id]);
+		SN_Helpers::send_json(true,'ذخیره شد');
+	}
+	public function ajax_hr_levels(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb; $rows=$wpdb->get_results("SELECT * FROM {$wpdb->prefix}sn_hr_levels ORDER BY sort_order ASC, id ASC",ARRAY_A); SN_Helpers::send_json(true,'',['items'=>$rows?:[]]);
+	}
+	public function ajax_hr_save_level(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb; $id=absint($_POST['id']??0); $title=sanitize_text_field(wp_unslash($_POST['title']??'')); if($title===''){SN_Helpers::send_json(false,'عنوان الزامی است');return;} $active=!empty($_POST['is_active'])?1:0;
+		if($id){ if(!$active){$use=(int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE level_id=%d",$id)); if($use>0){SN_Helpers::send_json(false,'این سطح در حال استفاده است');return;}} $wpdb->update($wpdb->prefix.'sn_hr_levels',['title'=>$title,'sort_order'=>(int)($_POST['sort_order']??0),'is_active'=>$active,'updated_at'=>current_time('mysql')],['id'=>$id]); }
+		else{$wpdb->insert($wpdb->prefix.'sn_hr_levels',['level_key'=>sanitize_title($title).'-'.time(),'title'=>$title,'sort_order'=>(int)($_POST['sort_order']??0),'is_system'=>0,'is_active'=>$active,'created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);}
+		SN_Helpers::send_json(true,'ذخیره شد');
+	}
+	public function ajax_hr_commission_models(): void
+	{ if (! $this->sn_hr_guard()) return; global $wpdb; $rows=$wpdb->get_results("SELECT * FROM {$wpdb->prefix}sn_hr_commission_models ORDER BY id DESC LIMIT 500", ARRAY_A); SN_Helpers::send_json(true,'',['items'=>$rows?:[]]); }
+	public function ajax_hr_save_commission_model(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb; $id=absint($_POST['id']??0);
+		$data=['title'=>sanitize_text_field(wp_unslash($_POST['title']??'')),'role_key'=>sanitize_key($_POST['role_key']??'sn_seller'),'level_id'=>absint($_POST['level_id']??0)?:null,'employment_status'=>in_array($_POST['employment_status']??'all',['training','contract','all'],true)?sanitize_key($_POST['employment_status']):'all','payment_method'=>in_array($_POST['payment_method']??'all',['online','card_to_card','all'],true)?sanitize_key($_POST['payment_method']):'all','commission_type'=>in_array($_POST['commission_type']??'percent',['percent','fixed'],true)?sanitize_key($_POST['commission_type']):'percent','commission_value'=>(float)($_POST['commission_value']??0),'applies_to'=>in_array($_POST['applies_to']??'seller',['seller','supervisor','manager','custom'],true)?sanitize_key($_POST['applies_to']):'seller','is_active'=>!empty($_POST['is_active'])?1:0,'updated_at'=>current_time('mysql')];
+		if($data['title']===''){SN_Helpers::send_json(false,'عنوان الزامی است');return;}
+		if($id){$wpdb->update($wpdb->prefix.'sn_hr_commission_models',$data,['id'=>$id]);}
+		else{$data['created_at']=current_time('mysql');$wpdb->insert($wpdb->prefix.'sn_hr_commission_models',$data);}
+		SN_Helpers::send_json(true,'ذخیره شد');
+	}
+
+	private function sn_hr_my_profile_row(): ?array
+	{
+		if (! is_user_logged_in()) return null; global $wpdb;
+		return $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d", get_current_user_id()), ARRAY_A);
+	}
+	
+	private function sn_hr_is_descendant(int $user_id, int $possible_parent): bool
+	{
+		global $wpdb; $guard=0; $cur=$possible_parent;
+		while($cur && $guard<30){ if($cur===$user_id) return true; $cur=(int)$wpdb->get_var($wpdb->prepare("SELECT parent_user_id FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d", $cur)); $guard++; }
+		return false;
+	}
+	private function sn_hr_can_access_employee(int $employee_user_id): bool
+	{
+		if ($this->sn_can_hr() || current_user_can('manage_options')) return true;
+		global $wpdb; $me=$this->sn_hr_my_profile_row(); if(!$me) return false;
+		return ! $this->sn_hr_is_descendant((int)$me['user_id'], $employee_user_id) && ((int)$wpdb->get_var($wpdb->prepare("SELECT parent_user_id FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d",$employee_user_id))===(int)$me['user_id']);
+	}
+private function sn_hr_is_upstream_approver(array $req): bool
+	{
+		if (current_user_can('manage_options') || $this->sn_can_hr()) return true;
+		$me = $this->sn_hr_my_profile_row();
+		if (! $me) return false;
+		return (int)($req['from_parent_user_id'] ?? 0) === (int)($me['user_id'] ?? 0);
+	}
+	private function sn_hr_next_status(array $req): string
+	{
+		if (empty($req['from_parent_user_id'])) return 'sent_to_hr';
+		global $wpdb;
+		$parent = $wpdb->get_row($wpdb->prepare("SELECT parent_user_id FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d", (int)$req['from_parent_user_id']), ARRAY_A);
+		return !empty($parent['parent_user_id']) ? 'pending_parent_approval' : 'sent_to_hr';
+	}
+	private function sn_hr_transfer_log(int $request_id, string $action, ?string $from, ?string $to, string $note=''): void
+	{ SN_HR_Transfers::log($request_id, $action, $from, $to, $note); }
+
+	public function ajax_hr_transfer_create(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$employee_user_id = absint($_POST['employee_user_id'] ?? 0);
+		$type = sanitize_key($_POST['request_type'] ?? 'transfer');
+		$to_parent_user_id = absint($_POST['to_parent_user_id'] ?? 0) ?: null;
+		$reason = sanitize_textarea_field(wp_unslash($_POST['reason'] ?? ''));
+		$effective = sanitize_text_field(wp_unslash($_POST['effective_from'] ?? ''));
+		if (! in_array($type,['transfer','no_need','termination'],true) || ! $employee_user_id || $reason===''){ SN_Helpers::send_json(false,'اطلاعات درخواست نامعتبر است'); return; }
+		if ($type==='transfer' && ! $to_parent_user_id) { SN_Helpers::send_json(false,'برای جابجایی، سرپرست مقصد الزامی است'); return; }
+		if ($to_parent_user_id && $to_parent_user_id===$employee_user_id){ SN_Helpers::send_json(false,'کارمند نمی‌تواند سرپرست خودش باشد'); return; }
+		$me = $this->sn_hr_my_profile_row();
+		$emp = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d", $employee_user_id), ARRAY_A);
+		if (! $emp) { SN_Helpers::send_json(false,'کارمند یافت نشد'); return; }
+		if (! current_user_can('manage_options') && ! $this->sn_can_hr() && (int)$emp['parent_user_id'] !== (int)($me['user_id']??0)) { SN_Helpers::send_json(false,'این کارمند زیرمجموعه شما نیست'); return; }
+		if ($to_parent_user_id) { $target=$wpdb->get_row($wpdb->prepare("SELECT user_id,parent_user_id,is_active FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d",$to_parent_user_id),ARRAY_A); if(!$target|| (int)$target['is_active']!==1){SN_Helpers::send_json(false,'سرپرست مقصد نامعتبر یا غیرفعال است');return;} if($this->sn_hr_is_descendant($employee_user_id,$to_parent_user_id)){SN_Helpers::send_json(false,'انتخاب مقصد باعث حلقه سازمانی می‌شود');return;} }
+		$status = 'pending_parent_approval';
+		$wpdb->insert($wpdb->prefix.'sn_hr_transfer_requests', ['employee_user_id'=>$employee_user_id,'requested_by_user_id'=>get_current_user_id(),'from_parent_user_id'=>(int)($emp['parent_user_id']??0),'to_parent_user_id'=>$to_parent_user_id,'request_type'=>$type,'reason'=>$reason,'status'=>$status,'final_hr_user_id'=>null,'created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);
+		$id=(int)$wpdb->insert_id;
+		if($effective!==''){ $wpdb->update($wpdb->prefix.'sn_hr_transfer_requests',['updated_at'=>current_time('mysql')],['id'=>$id]); }
+		$this->sn_hr_transfer_log($id,'create',null,$status,$reason);
+		SN_Helpers::send_json(true,'درخواست ثبت شد و در مسیر تایید قرار گرفت',['id'=>$id]);
+	}
+
+	public function ajax_hr_transfer_list(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$tab=sanitize_key($_POST['tab']??'mine'); $me=$this->sn_hr_my_profile_row();
+		$where='1=1'; $args=[];
+		if ($this->sn_can_hr()) { if($tab==='hr_queue'){$where="status='sent_to_hr'";} }
+		else { if($tab==='approvals'){ $where="from_parent_user_id=%d AND status IN ('pending_parent_approval','approved_by_parent')"; $args[]=(int)($me['user_id']??0);} else { $where='requested_by_user_id=%d'; $args[]=get_current_user_id(); } }
+		$sql="SELECT r.*, e.full_name, e.role_key FROM {$wpdb->prefix}sn_hr_transfer_requests r LEFT JOIN {$wpdb->prefix}sn_hr_employee_profiles e ON e.user_id=r.employee_user_id WHERE {$where} ORDER BY r.id DESC LIMIT 300";
+		$rows=$args?$wpdb->get_results($wpdb->prepare($sql,...$args),ARRAY_A):$wpdb->get_results($sql,ARRAY_A);
+		foreach($rows as &$r){ $r['logs']=$wpdb->get_results($wpdb->prepare("SELECT l.*, u.display_name FROM {$wpdb->prefix}sn_hr_transfer_logs l LEFT JOIN {$wpdb->users} u ON u.ID=l.actor_user_id WHERE transfer_request_id=%d ORDER BY id DESC",(int)$r['id']),ARRAY_A); }
+		SN_Helpers::send_json(true,'',['items'=>$rows?:[]]);
+	}
+
+	public function ajax_hr_transfer_action(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$id=absint($_POST['id']??0); $action=sanitize_key($_POST['do']??''); $note=sanitize_textarea_field(wp_unslash($_POST['note']??''));
+		$req=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_transfer_requests WHERE id=%d",$id),ARRAY_A); if(!$req){SN_Helpers::send_json(false,'درخواست یافت نشد');return;}
+		$from=(string)$req['status']; $to=$from;
+		if (in_array($action,['approve','reject','request_changes'],true) && ! $this->sn_hr_is_upstream_approver($req)){ SN_Helpers::send_json(false,'دسترسی تایید ندارید'); return; }
+		if (in_array($from,['completed','rejected'],true)) { SN_Helpers::send_json(false,'این درخواست نهایی شده و قابل تغییر نیست'); return; }
+		if ($action==='finalize' && ! $this->sn_can_hr()) { SN_Helpers::send_json(false,'فقط منابع انسانی می‌تواند نهایی کند'); return; }
+		if ($action==='approve') { $to = $this->sn_can_hr() ? 'completed' : $this->sn_hr_next_status($req); }
+		elseif ($action==='reject') { $to='rejected'; }
+		elseif ($action==='request_changes') { $to='approved_by_parent'; }
+		elseif ($action==='finalize' && $this->sn_can_hr()) { $to='completed'; } else if(!in_array($action,['approve','reject','request_changes','finalize'],true)){ SN_Helpers::send_json(false,'اقدام نامعتبر'); return; }
+		$wpdb->update($wpdb->prefix.'sn_hr_transfer_requests',['status'=>$to,'final_hr_user_id'=>$this->sn_can_hr()?get_current_user_id():null,'updated_at'=>current_time('mysql')],['id'=>$id]);
+		$this->sn_hr_transfer_log($id,$action,$from,$to,$note);
+		if ($to==='completed') {
+			$emp=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d",(int)$req['employee_user_id']),ARRAY_A);
+			if($emp){
+				$new_parent = $req['request_type']==='transfer' ? (int)$req['to_parent_user_id'] : null;
+				if($req['request_type']==='termination'){ $wpdb->update($wpdb->prefix.'sn_hr_employee_profiles',['is_active'=>0,'left_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')],['user_id'=>(int)$req['employee_user_id']]); }
+				elseif($req['request_type']==='no_need'){ $wpdb->update($wpdb->prefix.'sn_hr_employee_profiles',['parent_user_id'=>null,'updated_at'=>current_time('mysql')],['user_id'=>(int)$req['employee_user_id']]); }
+				else { $wpdb->update($wpdb->prefix.'sn_hr_employee_profiles',['parent_user_id'=>$new_parent,'updated_at'=>current_time('mysql')],['user_id'=>(int)$req['employee_user_id']]); }
+				$wpdb->insert($wpdb->prefix.'sn_hr_employee_assignment_history',['user_id'=>(int)$req['employee_user_id'],'previous_parent_user_id'=>$emp['parent_user_id']?:null,'new_parent_user_id'=>$new_parent,'previous_role_key'=>$emp['role_key'],'new_role_key'=>$emp['role_key'],'previous_level_id'=>$emp['level_id']?:null,'new_level_id'=>$emp['level_id']?:null,'changed_by_user_id'=>get_current_user_id(),'reason'=>$note?:$req['reason'],'effective_from'=>current_time('mysql'),'created_at'=>current_time('mysql')]);
+			}
+		}
+		SN_Helpers::send_json(true,'درخواست بروزرسانی شد',['status'=>$to]);
+	}
+
+	public function ajax_hr_employee_export(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb; $user_id=absint($_POST['user_id']??0); $summary=!empty($_POST['summary']); $limit=min(500,max(50,absint($_POST['limit']??200))); if(!$user_id){SN_Helpers::send_json(false,'شناسه نامعتبر');return;} if(! $this->sn_can_hr()){ $me=$this->sn_hr_my_profile_row(); $owned=(int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d AND parent_user_id=%d",$user_id,(int)($me['user_id']??0))); if(!$owned){SN_Helpers::send_json(false,'اجازه مشاهده این کارمند را ندارید');return;} }
+		$profile=$wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE user_id=%d",$user_id),ARRAY_A);
+		if(!$profile){SN_Helpers::send_json(false,'کارمند یافت نشد');return;}
+		$invoice_ids=$wpdb->get_col($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_invoices WHERE seller_id=%d OR supervisor_id=%d ORDER BY id DESC LIMIT %d",$user_id,$user_id,$limit)); $ph=$invoice_ids?implode(',',array_fill(0,count($invoice_ids),'%d')):'';
+		$data=['profile'=>$profile,'summary'=>['invoice_count'=>(int)count($invoice_ids),'lead_count'=>(int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_leads WHERE seller_id=%d OR supervisor_id=%d",$user_id,$user_id))]];
+		if(!$summary){
+			$data['assignment_history']=$wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_employee_assignment_history WHERE user_id=%d ORDER BY id DESC LIMIT %d",$user_id,$limit),ARRAY_A);
+			$data['leads']=$wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_leads WHERE seller_id=%d OR supervisor_id=%d ORDER BY id DESC LIMIT %d",$user_id,$user_id,$limit),ARRAY_A);
+			$data['invoices']=$invoice_ids?$wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_invoices WHERE id IN ($ph) ORDER BY id DESC",...$invoice_ids),ARRAY_A):[];
+			$data['wallet']=$wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_wallet_transactions WHERE user_id=%d ORDER BY id DESC LIMIT %d",$user_id,$limit),ARRAY_A);
+			$data['salary']=$wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_salary_ledger WHERE user_id=%d ORDER BY id DESC LIMIT %d",$user_id,$limit),ARRAY_A);
+			$data['transfer_requests']=$wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_transfer_requests WHERE employee_user_id=%d ORDER BY id DESC LIMIT %d",$user_id,$limit),ARRAY_A);
+			$data['transfer_logs']=$wpdb->get_results($wpdb->prepare("SELECT l.* FROM {$wpdb->prefix}sn_hr_transfer_logs l INNER JOIN {$wpdb->prefix}sn_hr_transfer_requests r ON r.id=l.transfer_request_id WHERE r.employee_user_id=%d ORDER BY l.id DESC LIMIT %d",$user_id,$limit),ARRAY_A);
+			if($invoice_ids){ $params=array_merge($invoice_ids,[$limit]); $data['activity']=$wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_activity_logs WHERE invoice_id IN ($ph) ORDER BY id DESC LIMIT %d",...$params),ARRAY_A); $data['invoice_workflow_logs']=$wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_invoice_logs WHERE invoice_id IN ($ph) ORDER BY id DESC LIMIT %d",...$params),ARRAY_A);} else {$data['activity']=[];$data['invoice_workflow_logs']=[];}
+		}
+		SN_Helpers::send_json(true,'',['data'=>$data]);
+	}
+
+	private function sn_hr_commission_context_parent_at(string $effective_from, int $employee_user_id): array
+	{
+		global $wpdb;
+		$before = $wpdb->get_row($wpdb->prepare("SELECT previous_parent_user_id, new_parent_user_id, effective_from FROM {$wpdb->prefix}sn_hr_employee_assignment_history WHERE user_id=%d AND effective_from<=%s ORDER BY effective_from DESC, id DESC LIMIT 1", $employee_user_id, $effective_from), ARRAY_A);
+		return ['employee_user_id'=>$employee_user_id,'effective_from'=>$effective_from,'eligible_parent_before'=>$before['previous_parent_user_id'] ?? null,'eligible_parent_after'=>$before['new_parent_user_id'] ?? null];
+	}
+
+	private function sn_valid_period(string $period): bool
+	{
+		return (bool) preg_match('/^\d{4}-(0[1-9]|1[0-2])$/', $period);
+	}
+	private function sn_hr_pick_model(array $profile, string $payment_method, string $applies_to): ?array
+	{
+		global $wpdb;
+		$rows = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_commission_models WHERE is_active=1 AND role_key=%s AND applies_to=%s ORDER BY id DESC", (string)$profile['role_key'], $applies_to), ARRAY_A);
+		foreach ($rows as $m) {
+			if ($m['employment_status'] !== 'all' && $m['employment_status'] !== $profile['employment_status']) continue;
+			if ($m['payment_method'] !== 'all' && $m['payment_method'] !== $payment_method) continue;
+			if (! empty($m['level_id']) && (int)$m['level_id'] !== (int)($profile['level_id'] ?? 0)) continue;
+			return $m;
+		}
+		return null;
+	}
+	private function sn_hr_calculate_period(string $period, bool $dry_run = true): array
+	{
+		global $wpdb;
+		$start = $period . '-01 00:00:00';
+		$end = date('Y-m-t 23:59:59', strtotime($start));
+		$employees = $wpdb->get_results("SELECT * FROM {$wpdb->prefix}sn_hr_employee_profiles WHERE is_active=1", ARRAY_A);
+		$out = [];
+		foreach ($employees as $e) {
+			$invoices = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_invoices WHERE (seller_id=%d OR supervisor_id=%d) AND paid_at BETWEEN %s AND %s AND (status IN ('paid','approved','completed') OR payment_status='approved' OR invoice_status='approved')", (int)$e['user_id'], (int)$e['user_id'], $start, $end), ARRAY_A);
+			$commission = 0.0; $count = 0; $warnings=[];
+			foreach ($invoices as $inv) {
+				$method = in_array((string)$inv['pay_method'], ['online','gateway'], true) ? 'online' : 'card_to_card';
+				$target = ((int)$inv['seller_id'] === (int)$e['user_id']) ? 'seller' : (((int)$inv['supervisor_id'] === (int)$e['user_id']) ? 'supervisor' : 'custom');
+				$model = $this->sn_hr_pick_model($e, $method, $target);
+				if (! $model) { $warnings[] = 'مدل پورسانت برای فاکتور #' . (int)$inv['id'] . ' یافت نشد'; continue; }
+				$basis = (float) (($inv['final_total'] ?: $inv['product_price']) ?: 0);
+				$amount = $model['commission_type'] === 'fixed' ? (float)$model['commission_value'] : ($basis * ((float)$model['commission_value'] / 100));
+				$ctx = $this->sn_hr_commission_context_parent_at((string)($inv['paid_at'] ?: $inv['created_at']), (int)$e['user_id']);
+				$commission += max(0, $amount);
+				$count++;
+				if (! $dry_run) {
+					$snapshot = wp_json_encode(['model'=>$model,'profile'=>$e,'payment_method'=>$method,'invoice_id'=>(int)$inv['id'],'basis'=>$basis,'commission'=>$amount,'context'=>$ctx,'calculated_at'=>current_time('mysql')], JSON_UNESCAPED_UNICODE);
+					$this->sn_add_wallet_transaction((int)$e['user_id'], $target === 'supervisor' ? 'supervisor' : 'seller', (float)$amount, 'credit', 'hr_commission', 'پورسانت HR برای فاکتور ' . (string)($inv['invoice_code'] ?? $inv['id']), (int)$inv['id'], (int)($inv['lead_id'] ?? 0), ['source_type'=>'commission','source_id'=>(int)$model['id'],'period_key'=>$period,'calculation_snapshot'=>$snapshot]);
+				}
+			}
+			$base = (float)($e['base_salary'] ?? 0);
+			$total = $base + $commission;
+			$out[] = ['employee'=>$e,'base_salary'=>$base,'commission_count'=>$count,'commission_amount'=>$commission,'total_payable'=>$total,'warnings'=>$warnings];
+			if (! $dry_run) {
+				$exists = $wpdb->get_row($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_hr_salary_ledger WHERE user_id=%d AND period_key=%s", (int)$e['user_id'], $period), ARRAY_A);
+				if (! $exists) {
+					$wpdb->insert($wpdb->prefix.'sn_hr_salary_ledger',['user_id'=>(int)$e['user_id'],'period_key'=>$period,'base_salary'=>$base,'commission_amount'=>$commission,'adjustments'=>0,'payable_amount'=>$total,'status'=>'draft','created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);
+				}
+				$ledger_id = (int)$wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_hr_salary_ledger WHERE user_id=%d AND period_key=%s", (int)$e['user_id'], $period));
+				$this->sn_add_wallet_transaction((int)$e['user_id'], ((string)$e['role_key']==='sn_supervisor'?'supervisor':'seller'), $base, 'credit', 'hr_salary', 'حقوق پایه دوره '.$period, null, null, ['source_type'=>'salary','source_id'=>$ledger_id,'period_key'=>$period,'calculation_snapshot'=>wp_json_encode(['base_salary'=>$base,'period'=>$period,'employee'=>$e], JSON_UNESCAPED_UNICODE)]);
+			}
+		}
+		return $out;
+	}
+	public function ajax_hr_payroll_preview(): void
+	{
+		if (! $this->sn_hr_guard()) return; $period=sanitize_text_field($_POST['period_key']??''); if(! $this->sn_valid_period($period)){SN_Helpers::send_json(false,'فرمت دوره نامعتبر است (YYYY-MM)');return;} $rows=$this->sn_hr_calculate_period($period,true); SN_Helpers::send_json(true,'پیش‌نمایش محاسبه شد',['items'=>$rows]);
+	}
+	public function ajax_hr_payroll_generate(): void
+	{
+		if (! $this->sn_hr_guard()) return; $period=sanitize_text_field($_POST['period_key']??''); $dry=!empty($_POST['dry_run']); if(! $this->sn_valid_period($period)){SN_Helpers::send_json(false,'فرمت دوره نامعتبر است');return;} $rows=$this->sn_hr_calculate_period($period,$dry); SN_Helpers::send_json(true,$dry?'پیش‌نمایش آماده شد':'درفت حقوق تولید شد',['items'=>$rows]);
+	}
+	public function ajax_hr_payroll_approve(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb; $period=sanitize_text_field($_POST['period_key']??''); if(! $this->sn_valid_period($period)){SN_Helpers::send_json(false,'فرمت دوره نامعتبر است');return;} $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}sn_hr_salary_ledger SET status='approved', updated_at=%s WHERE period_key=%s AND status='draft'", current_time('mysql'), $period)); SN_Helpers::send_json(true,'حقوق دوره تایید شد');
+	}
+	public function ajax_hr_payroll_mark_paid(): void
+	{
+		if (! $this->sn_hr_guard()) return; global $wpdb; $period=sanitize_text_field($_POST['period_key']??''); if(! $this->sn_valid_period($period)){SN_Helpers::send_json(false,'فرمت دوره نامعتبر است');return;} $wpdb->query($wpdb->prepare("UPDATE {$wpdb->prefix}sn_hr_salary_ledger SET status='paid', updated_at=%s WHERE period_key=%s AND status='approved'", current_time('mysql'), $period)); SN_Helpers::send_json(true,'حقوق دوره پرداخت‌شده ثبت شد');
+	}
+
 	// =========================================================
 	// ADMIN PAGES
 	// =========================================================
@@ -3351,11 +3732,11 @@ class SN_Plugin
 	public function render_admin_page(): void
 	{
 		global $wpdb;
-		$total_leads     = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_leads");
-		$unassigned      = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_leads WHERE status='unassigned'");
-		$total_invoices  = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_invoices");
-		$paid_invoices   = (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_invoices WHERE status IN ('paid','approved') OR payment_status='approved' OR invoice_status='approved'");
-		$total_revenue   = (float) $wpdb->get_var("SELECT COALESCE(SUM(COALESCE(final_total, product_price, 0)),0) FROM {$wpdb->prefix}sn_invoices WHERE status IN ('paid','approved') OR payment_status='approved' OR invoice_status='approved'");
+		$total_leads = $this->sn_count_metric('lead','lead_total');
+		$unassigned = $this->sn_count_metric('lead','lead_active',["status='unassigned'"]);
+		$total_invoices = $this->sn_count_metric('invoice','invoice_issued');
+		$paid_invoices = $this->sn_count_metric('invoice','payment_financial_approved');
+		$total_revenue = $this->sn_sum_metric_amount('payment_financial_approved');
 		$total_sellers   = (int) (new \WP_User_Query(['role' => 'sn_seller', 'count_total' => true]))->get_total();
 	?>
 		<div class="wrap sn-admin" dir="rtl">
@@ -3368,6 +3749,9 @@ class SN_Plugin
 				<div class="sn-stat sn-stat-success"><span><?php echo number_format($paid_invoices); ?></span><label>پرداخت شده</label></div>
 				<div class="sn-stat sn-stat-primary"><span><?php echo SN_Helpers::format_price($total_revenue); ?></span><label>درآمد کل</label></div>
 			</div>
+			<?php if (current_user_can('manage_options')): $dbg = $this->sn_report_status_debug_counts(); ?>
+			<div class="sn-card" style="margin-top:12px"><h3>بررسی وضعیت خام گزارش‌ها (فقط ادمین)</h3><pre><?php echo esc_html(wp_json_encode($dbg, JSON_PRETTY_PRINT|JSON_UNESCAPED_UNICODE)); ?></pre></div>
+			<?php endif; ?>
 		</div>
 	<?php
 	}
@@ -3913,7 +4297,8 @@ class SN_Plugin
 				$total = (int)$wpdb->get_var($wpdb->prepare("SELECT COUNT(*) FROM {$wpdb->prefix}sn_invoices WHERE {$sql_where}", ...$args));
 				$rows = $wpdb->get_results($wpdb->prepare("SELECT * FROM {$wpdb->prefix}sn_invoices WHERE {$sql_where} ORDER BY id DESC LIMIT %d OFFSET %d", ...array_merge($args, [$limit, $offset])), ARRAY_A);
 				foreach ($rows as &$row) { $row['product_name'] = $this->sn_invoice_items_label((int)$row['id'], (int)$row['product_id']); $row['amount_fmt'] = SN_Helpers::format_price((float)($row['final_total'] ?: $row['product_price'])); $row['status_label'] = SN_Helpers::status_label((string)$row['status']); }
-				SN_Helpers::send_json(true, '', ['invoices'=>$rows, 'items'=>$rows, 'page'=>$page, 'limit'=>$limit, 'total'=>$total]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['invoices'=>$rows, 'items'=>$rows, 'page'=>$page, 'limit'=>$limit, 'total'=>$total]);
 			}
 
 
@@ -3942,7 +4327,8 @@ class SN_Plugin
 					"SELECT id, phone, imported_at FROM {$wpdb->prefix}sn_leads WHERE supervisor_id=%d AND seller_id IS NULL AND status='supervisor_pool' ORDER BY id ASC LIMIT 300",
 					$supervisor_id
 				), ARRAY_A);
-				SN_Helpers::send_json(true, '', ['leads' => $leads ?: []]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['leads' => $leads ?: []]);
 			}
 
 			public function ajax_confirm_card_payment(): void
@@ -3997,7 +4383,8 @@ class SN_Plugin
 					"SELECT * FROM {$wpdb->prefix}sn_invoices WHERE id=%d",
 					$id
 				));
-				$wpdb->update($wpdb->prefix . 'sn_invoices', $data, ['id' => $id]);
+				SN_Invoice_State_Machine::transition($id, $status, 'admin_change_status');
+			$wpdb->update($wpdb->prefix . 'sn_invoices', $data, ['id' => $id]);
 
 				// اگه تبدیل به فاکتور شد، action بزن
 				if ($status === 'paid' && $inv_row) {
@@ -4220,7 +4607,8 @@ class SN_Plugin
 					"SELECT id, label, color, sort_order, destination_panel, move_to_destination FROM {$table} WHERE is_active=1 ORDER BY sort_order ASC",
 					ARRAY_A
 				);
-				SN_Helpers::send_json(true, '', ['statuses' => $statuses ?: []]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['statuses' => $statuses ?: []]);
 			}
 
 			public function ajax_save_statuses(): void
@@ -4580,7 +4968,8 @@ class SN_Plugin
 				$seller = ! empty($lead['seller_id']) ? get_user_by('id', (int) $lead['seller_id']) : null;
 				$supervisor = ! empty($lead['supervisor_id']) ? get_user_by('id', (int) $lead['supervisor_id']) : null;
 				$wp_customer = $this->sn_find_wp_user_by_phone((string)($lead['phone'] ?? ''));
-				SN_Helpers::send_json(true, '', ['lead' => $lead, 'seller' => $seller ? $seller->display_name : '', 'supervisor' => $supervisor ? $supervisor->display_name : '', 'wp_user' => $wp_customer, 'invoices' => $invoices, 'status_history' => $status_history, 'activity' => $activity]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['lead' => $lead, 'seller' => $seller ? $seller->display_name : '', 'supervisor' => $supervisor ? $supervisor->display_name : '', 'wp_user' => $wp_customer, 'invoices' => $invoices, 'status_history' => $status_history, 'activity' => $activity]);
 			}
 
 			public function ajax_supervisor_unassign_leads(): void
@@ -4660,7 +5049,55 @@ class SN_Plugin
 				SN_Helpers::send_json(true, count($ids) . ' شماره از فروشنده جدا شد', ['lead_ids' => $ids]);
 			}
 
-			private function sn_table_columns(string $table): array
+		
+	public static function write_invoice_workflow_log_static(int $invoice_id, array $data = []): void
+	{
+		global $wpdb;
+		$table = $wpdb->prefix . 'sn_invoice_logs';
+		$payload = [
+			'invoice_id' => $invoice_id,
+			'lead_id' => $data['lead_id'] ?? null,
+			'actor_user_id' => $data['actor_user_id'] ?? (get_current_user_id() ?: null),
+			'actor_role' => sanitize_text_field((string) ($data['actor_role'] ?? ((wp_get_current_user()->roles[0] ?? 'system')))),
+			'from_status' => isset($data['from_status']) ? sanitize_text_field((string) $data['from_status']) : null,
+			'to_status' => isset($data['to_status']) ? sanitize_text_field((string) $data['to_status']) : null,
+			'action_type' => sanitize_key((string) ($data['action_type'] ?? 'workflow')),
+			'note' => sanitize_textarea_field((string) ($data['note'] ?? '')),
+			'assigned_from_user_id' => $data['assigned_from_user_id'] ?? null,
+			'assigned_to_user_id' => $data['assigned_to_user_id'] ?? null,
+			'created_at' => current_time('mysql'),
+		];
+		$wpdb->insert($table, $payload);
+	}
+
+	private function sn_user_can_view_invoice(int $invoice_id): bool
+	{
+		if (current_user_can('manage_options') || $this->sn_can_finance()) { return true; }
+		if (! is_user_logged_in()) { return false; }
+		global $wpdb; $u = wp_get_current_user();
+		$inv = $wpdb->get_row($wpdb->prepare("SELECT i.seller_id, l.supervisor_id FROM {$wpdb->prefix}sn_invoices i LEFT JOIN {$wpdb->prefix}sn_leads l ON l.id=i.lead_id WHERE i.id=%d", $invoice_id));
+		if (! $inv) return false;
+		if (in_array('sn_seller', (array)$u->roles, true)) return (int)$inv->seller_id === (int)$u->ID;
+		if (in_array('sn_supervisor', (array)$u->roles, true)) return (int)$inv->supervisor_id === (int)$u->ID;
+		return false;
+	}
+
+	private function sn_get_invoice_logs(int $invoice_id): array
+	{
+		global $wpdb;
+		$rows = $wpdb->get_results($wpdb->prepare("SELECT l.*, u.display_name FROM {$wpdb->prefix}sn_invoice_logs l LEFT JOIN {$wpdb->users} u ON u.ID=l.actor_user_id WHERE l.invoice_id=%d ORDER BY l.id DESC LIMIT 200", $invoice_id), ARRAY_A);
+		return $rows ?: [];
+	}
+
+	public function ajax_invoice_logs(): void
+	{
+		if (! is_user_logged_in() || (! check_ajax_referer('sn_public', 'nonce', false) && ! check_ajax_referer('sn_admin', 'nonce', false))) { SN_Helpers::send_json(false, 'دسترسی غیرمجاز'); return; }
+		$invoice_id = absint($_POST['invoice_id'] ?? 0);
+		if (! $invoice_id || ! $this->sn_user_can_view_invoice($invoice_id)) { SN_Helpers::send_json(false, 'اجازه مشاهده تاریخچه این فاکتور را ندارید'); return; }
+		$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['logs' => $this->sn_get_invoice_logs($invoice_id)]);
+	}
+	private function sn_table_columns(string $table): array
 			{
 				global $wpdb;
 				static $cache = [];
@@ -4748,6 +5185,7 @@ class SN_Plugin
 				$ok = false !== $wpdb->update($wpdb->prefix . 'sn_invoices', $data, ['id' => $invoice_id]);
 				if ($ok) {
 					$this->sn_log_activity($invoice_id, (int) $invoice->lead_id, $source === 'supervisor_upload' ? 'supervisor_payment_submitted' : 'customer_payment_submitted', 'ثبت فیش/اطلاعات واریزی و ارسال به تایید مالی', array_merge(['source' => $source, 'old_value' => (string) $invoice->status, 'new_value' => 'pending_financial_approval'], $extra));
+				self::write_invoice_workflow_log_static($invoice_id, ['lead_id'=>(int)$invoice->lead_id,'from_status'=>(string)$invoice->status,'to_status'=>'pending_financial_approval','action_type'=>$source === 'supervisor_upload' ? 'supervisor_receipt_upload' : 'card_to_card_submission','note'=>'ارسال برای بررسی مالی']);
 					$uploaded_type = $source === 'supervisor_upload' ? 'supervisor' : ($source === 'seller_upload' ? 'seller' : 'customer');
 					$wpdb->insert($wpdb->prefix . 'sn_payments', $this->sn_filter_existing_columns($wpdb->prefix . 'sn_payments', [
 						'invoice_id' => $invoice_id,
@@ -4874,6 +5312,7 @@ class SN_Plugin
 				]);
 				$wpdb->update($invoice_table, $data, ['id' => $id]);
 				$this->sn_log_activity($id, (int) $inv->lead_id, 'payment_approved', 'پرداخت توسط واحد مالی تایید شد', ['approved_by' => get_current_user_id(), 'old_value' => (string) $inv->status, 'new_value' => 'approved']);
+				self::write_invoice_workflow_log_static($id, ['lead_id'=>(int)$inv->lead_id,'from_status'=>(string)$inv->status,'to_status'=>'approved','action_type'=>'finance_approval','note'=>'تایید پرداخت توسط مالی']);
 				do_action('sn_invoice_paid', $id, $inv);
 				SN_Helpers::send_json(true, 'پرداخت تایید شد', ['status' => 'approved', 'status_label' => SN_Helpers::status_label('approved'), 'reviewed_by' => get_current_user_id(), 'reviewed_at' => current_time('mysql')]);
 			}
@@ -4920,6 +5359,7 @@ class SN_Plugin
 				]);
 				$wpdb->update($invoice_table, $data, ['id' => $id]);
 				$this->sn_log_activity($id, (int) $inv->lead_id, 'payment_rejected', 'پرداخت توسط واحد مالی رد شد', ['reason' => $reason, 'rejected_by' => get_current_user_id(), 'old_value' => (string) $inv->status, 'new_value' => 'rejected']);
+				self::write_invoice_workflow_log_static($id, ['lead_id'=>(int)$inv->lead_id,'from_status'=>(string)$inv->status,'to_status'=>'rejected','action_type'=>'finance_rejection','note'=>$reason]);
 				SN_Helpers::send_json(true, 'پرداخت رد شد', ['status' => 'rejected', 'status_label' => SN_Helpers::status_label('rejected'), 'reviewed_by' => get_current_user_id(), 'reviewed_at' => current_time('mysql')]);
 			}
 
@@ -5047,7 +5487,8 @@ class SN_Plugin
 					$seller_ids = array_values(array_unique(array_merge($seller_ids, array_map('intval', $lead_seller_ids))));
 				}
 				if (! $seller_ids) {
-					SN_Helpers::send_json(true, '', ['items' => []]);
+					$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['items' => []]);
 					return;
 				}
 				$ph = implode(',', array_fill(0, count($seller_ids), '%d'));
@@ -5070,7 +5511,8 @@ class SN_Plugin
 					$r['pay_method_label'] = SN_Helpers::pay_method_label((string) $r['pay_method']);
 					$r['payment_source_label'] = SN_Helpers::payment_source_label((string) $r['payment_source']);
 				}
-				SN_Helpers::send_json(true, '', ['items' => $rows]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['items' => $rows]);
 			}
 			public function render_financial_approval_page(): void
 			{
@@ -5376,7 +5818,8 @@ class SN_Plugin
 				}
 				$sql = "SELECT l.id,l.phone,l.province,l.city,l.status,l.lead_status,l.updated_at,MAX(i.customer_name) customer_name,MAX(u.display_name) seller_name FROM {$wpdb->prefix}sn_leads l LEFT JOIN {$wpdb->prefix}sn_invoices i ON i.lead_id=l.id LEFT JOIN {$wpdb->users} u ON u.ID=l.seller_id WHERE {$where} GROUP BY l.id ORDER BY l.updated_at DESC,l.id DESC LIMIT 80";
 				$items = $args ? $wpdb->get_results($wpdb->prepare($sql, ...$args), ARRAY_A) : $wpdb->get_results($sql, ARRAY_A);
-				SN_Helpers::send_json(true, '', ['items' => $items]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['items' => $items]);
 			}
 
 			public function ajax_seller_profile(): void
@@ -5414,7 +5857,8 @@ class SN_Plugin
 				];
 				$recent_leads = $wpdb->get_results($wpdb->prepare("SELECT id,phone,province,city,lead_status,status,assigned_at,updated_at FROM {$wpdb->prefix}sn_leads WHERE seller_id=%d ORDER BY updated_at DESC LIMIT 50", $seller_id), ARRAY_A);
 				$recent_invoices = $wpdb->get_results($wpdb->prepare("SELECT id,invoice_code,customer_name,customer_phone,product_price,final_total,status,created_at FROM {$wpdb->prefix}sn_invoices WHERE seller_id=%d ORDER BY id DESC LIMIT 50", $seller_id), ARRAY_A);
-				SN_Helpers::send_json(true, '', ['seller' => ['id' => $s->ID, 'name' => $s->display_name, 'phone' => $s->user_login, 'registered' => $s->user_registered], 'stats' => $stats, 'recent_leads' => $recent_leads, 'recent_invoices' => $recent_invoices]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['seller' => ['id' => $s->ID, 'name' => $s->display_name, 'phone' => $s->user_login, 'registered' => $s->user_registered], 'stats' => $stats, 'recent_leads' => $recent_leads, 'recent_invoices' => $recent_invoices]);
 			}
 			// =========================================================
 			// WALLET / COMMISSION MODULE
@@ -5482,8 +5926,8 @@ class SN_Plugin
 				}
 				global $wpdb;
 				$wallet_id = $this->sn_wallet_id($user_id, $wallet_type);
-				if ($invoice_id && in_array($type, ['seller_commission', 'supervisor_commission'], true)) {
-					$exists = (int) $wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_wallet_transactions WHERE invoice_id=%d AND user_id=%d AND wallet_type=%s AND type=%s LIMIT 1", $invoice_id, $user_id, $wallet_type, $type));
+				if (($invoice_id && in_array($type, ['seller_commission', 'supervisor_commission','hr_commission'], true)) || ($type==='hr_salary' && !empty($meta['period_key']))) {
+					if($type==='hr_salary'){ $exists = (int) $wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_wallet_transactions WHERE user_id=%d AND wallet_type=%s AND type=%s AND period_key=%s LIMIT 1", $user_id, $wallet_type, $type, (string)($meta['period_key']??''))); } else { $exists = (int) $wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_wallet_transactions WHERE invoice_id=%d AND user_id=%d AND wallet_type=%s AND type=%s LIMIT 1", $invoice_id, $user_id, $wallet_type, $type)); }
 					if ($exists) {
 						return false;
 					}
@@ -5500,6 +5944,10 @@ class SN_Plugin
 					'status' => 'approved',
 					'description' => $description,
 					'meta' => wp_json_encode($meta, JSON_UNESCAPED_UNICODE),
+				'source_type' => $meta['source_type'] ?? null,
+				'source_id' => $meta['source_id'] ?? null,
+				'period_key' => $meta['period_key'] ?? null,
+				'calculation_snapshot' => $meta['calculation_snapshot'] ?? null,
 					'created_by' => get_current_user_id() ?: null,
 				]);
 				if ($wpdb->insert_id) {
@@ -5850,7 +6298,8 @@ class SN_Plugin
 					foreach ($rows as &$r) {
 						$r['created_at_jalali'] = SN_Helpers::gregorian_to_jalali_date($r['created_at'] ?? '');
 					}
-					SN_Helpers::send_json(true, '', ['items' => $rows ?: [], 'invoice_id' => $detail_invoice_id]);
+					$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['items' => $rows ?: [], 'invoice_id' => $detail_invoice_id]);
 					return;
 				}
 
@@ -5882,7 +6331,8 @@ class SN_Plugin
 					$r['customer_phone'] = $r['customer_phone'] ?: '';
 					$r['customer_name'] = $r['customer_name'] ?: '—';
 				}
-				SN_Helpers::send_json(true, '', ['items' => $rows ?: [], 'total' => $total, 'page' => $page, 'limit' => $limit, 'has_more' => ($offset + $limit) < $total]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['items' => $rows ?: [], 'total' => $total, 'page' => $page, 'limit' => $limit, 'has_more' => ($offset + $limit) < $total]);
 			}
 
 			public function ajax_invoice_recontact(): void
@@ -5902,6 +6352,7 @@ class SN_Plugin
 					'updated_at' => current_time('mysql'),
 				]), ['id' => (int) $invoice->id]);
 				$this->sn_log_activity((int) $invoice->id, (int) $invoice->lead_id, 'invoice_recontact_requested', 'درخواست ارتباط مجدد با کارشناس توسط مشتری', ['note' => $note]);
+				self::write_invoice_workflow_log_static((int)$invoice->id, ['lead_id'=>(int)$invoice->lead_id,'from_status'=>(string)$invoice->status,'to_status'=>'recontact_requested','action_type'=>'seller_to_supervisor','note'=>$note]);
 				SN_Helpers::send_json(true, 'فاکتور شما به کارشناس مربوطه ارجاع داده شد. منتظر تماس کارشناس باشید.', ['status' => 'recontact_requested']);
 			}
 
@@ -5926,6 +6377,7 @@ class SN_Plugin
 					'updated_at' => current_time('mysql'),
 				]), ['id' => $id]);
 				$this->sn_log_activity($id, (int) $inv->lead_id, 'seller_resend_to_financial', 'ارجاع مجدد فاکتور رد شده به تایید مالی', ['note' => $note]);
+				self::write_invoice_workflow_log_static($id, ['lead_id'=>(int)$inv->lead_id,'from_status'=>(string)$inv->status,'to_status'=>'pending_financial_approval','action_type'=>'seller_resubmit_finance','note'=>$note]);
 				SN_Helpers::send_json(true, 'فاکتور دوباره به تایید مالی ارسال شد');
 			}
 
@@ -5940,9 +6392,10 @@ class SN_Plugin
 				$limit = min(50, max(10, absint($_POST['limit'] ?? 30)));
 				$offset = ($page - 1) * $limit;
 				global $wpdb;
-				$needs = "(i.status IN ('pending_financial_approval','receipt_uploaded') OR i.payment_status IN ('pending_financial_approval','receipt_uploaded') OR i.invoice_status IN ('pending_financial_approval','receipt_uploaded') OR ((COALESCE(i.receipt_url,'')<>'' OR COALESCE(i.receipt_file,'')<>'' OR COALESCE(i.manual_card_from,'')<>'' OR COALESCE(i.deposit_card_from_last4,'')<>'') AND i.status NOT IN ('approved','paid','rejected') AND COALESCE(i.payment_status,'') NOT IN ('approved','rejected')))";
-				$approved = "(i.status='approved' OR i.payment_status='approved' OR i.invoice_status='approved')";
-				$rejected = "(i.status='rejected' OR i.payment_status='rejected' OR i.invoice_status='rejected')";
+				$defs = $this->sn_stats_definitions();
+				$needs = str_replace(['status','payment_status','invoice_status'], ['i.status','i.payment_status','i.invoice_status'], $defs['payment_pending_review']);
+				$approved = str_replace(['status','payment_status','invoice_status','financial_return_state'], ['i.status','i.payment_status','i.invoice_status','i.financial_return_state'], $defs['payment_financial_approved']);
+				$rejected = str_replace(['status','payment_status','invoice_status','financial_return_state'], ['i.status','i.payment_status','i.invoice_status','i.financial_return_state'], $defs['payment_financial_rejected']);
 				$onlinePaid = "(i.pay_method IN ('online','gateway') AND i.status IN ('paid','approved'))";
 				if ($tab === 'online_paid') { $where = $onlinePaid; }
 				elseif ($tab === 'approved') { $where = $approved; }
@@ -5982,7 +6435,8 @@ class SN_Plugin
 					'approved' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_invoices i WHERE {$approved}"),
 					'rejected' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_invoices i WHERE {$rejected}"),
 				];
-				SN_Helpers::send_json(true, '', ['items' => $rows, 'page' => $page, 'limit' => $limit, 'total' => $total, 'kpi' => $kpi]);
+				$timeline = $this->sn_get_invoice_logs((int) $invoice->id);
+		SN_Helpers::send_json(true, '', ['items' => $rows, 'page' => $page, 'limit' => $limit, 'total' => $total, 'kpi' => $kpi]);
 			}
 
 
