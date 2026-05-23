@@ -3480,24 +3480,49 @@ class SN_Plugin
 		if (! is_user_logged_in() || ! $this->sn_can_hr() || ! check_ajax_referer('sn_public', 'nonce', false)) { SN_Helpers::send_json(false, 'دسترسی غیرمجاز'); return false; }
 		return true;
 	}
+	private function sn_hr_debug_data(string $action, array $extra = []): array
+	{
+		global $wpdb;
+		$user = wp_get_current_user();
+		return array_merge([
+			'action' => $action,
+			'user_id' => get_current_user_id(),
+			'roles' => (array) ($user->roles ?? []),
+			'can_hr' => $this->sn_can_hr(),
+			'db_last_error' => (string) ($wpdb->last_error ?? ''),
+		], $extra);
+	}
 	public function ajax_hr_backfill_employees(): void
 	{
-		if (! $this->sn_hr_guard()) return;
-		SN_HR::backfill_employee_profiles();
-		SN_Helpers::send_json(true, 'بازسازی کارمندان انجام شد');
+		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$roles = ['sn_seller', 'sn_supervisor', 'sn_sales_manager'];
+		$total_users = (int) count(get_users(['role__in' => $roles, 'number' => 5000, 'fields' => 'ID']));
+		if ($total_users < 1) {
+			$msg = 'هیچ کاربر فروشنده/سرپرست/مدیر فروشی برای ساخت پروفایل پیدا نشد.';
+			SN_Helpers::send_json(false, $msg, ['data' => ['inserted_count'=>0,'existing_count'=>0,'total_count'=>0], 'debug' => $this->sn_hr_debug_data('sn_hr_backfill_employees', ['inserted_count'=>0,'existing_count'=>0,'total_count'=>0])]);
+			return;
+		}
+		$counts = SN_HR::backfill_employee_profiles();
+		$msg = 'بازسازی کارمندان انجام شد. جدید: '.$counts['inserted_count'].' | موجود: '.$counts['existing_count'].' | کل: '.$counts['total_count'];
+		SN_Helpers::send_json(true, $msg, ['data' => $counts, 'debug' => $this->sn_hr_debug_data('sn_hr_backfill_employees', $counts + ['db_last_error'=>(string)$wpdb->last_error])]);
 	}
 	public function ajax_hr_seed_levels(): void
 	{
 		if (! $this->sn_hr_guard()) return; global $wpdb;
 		$defaults = ['کارآموز','کارشناس','ارشد','سرپرست','مدیر'];
 		$sort = 10;
+		$inserted_count = 0;
+		$existing_count = 0;
 		foreach ($defaults as $title) {
 			$exists = (int) $wpdb->get_var($wpdb->prepare("SELECT id FROM {$wpdb->prefix}sn_hr_levels WHERE title=%s LIMIT 1", $title));
-			if ($exists) { continue; }
-			$wpdb->insert($wpdb->prefix.'sn_hr_levels',['level_key'=>sanitize_title($title).'-'.time().'-'.wp_rand(10,99),'title'=>$title,'sort_order'=>$sort,'is_system'=>1,'is_active'=>1,'created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);
+			if ($exists) { $existing_count++; continue; }
+			$ok = $wpdb->insert($wpdb->prefix.'sn_hr_levels',['level_key'=>sanitize_title($title).'-'.time().'-'.wp_rand(10,99),'title'=>$title,'sort_order'=>$sort,'is_system'=>1,'is_active'=>1,'created_at'=>current_time('mysql'),'updated_at'=>current_time('mysql')]);
+			if ($ok) { $inserted_count++; }
 			$sort += 10;
 		}
-		SN_Helpers::send_json(true, 'سطح‌های پیش‌فرض ایجاد/بررسی شدند');
+		$total_count = (int) count($defaults);
+		$msg = 'سطح‌های پیش‌فرض بررسی شد. جدید: '.$inserted_count.' | موجود: '.$existing_count.' | کل: '.$total_count;
+		SN_Helpers::send_json(true, $msg, ['data' => compact('inserted_count','existing_count','total_count'), 'debug' => $this->sn_hr_debug_data('sn_hr_seed_levels', compact('inserted_count','existing_count','total_count'))]);
 	}
 
 	public function ajax_hr_list_employees(): void
@@ -3541,12 +3566,21 @@ class SN_Plugin
 	public function ajax_hr_diagnostics(): void
 	{
 		if (! $this->sn_hr_guard()) return; global $wpdb;
+		$user = wp_get_current_user();
 		$data = [
-			'employees' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_employee_profiles"),
-			'levels' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_levels"),
-			'models' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_commission_models"),
+			'current_user_id' => get_current_user_id(),
+			'roles' => (array) ($user->roles ?? []),
+			'can_hr' => $this->sn_can_hr(),
+			'employee_profiles_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_employee_profiles"),
+			'levels_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_levels"),
+			'commission_models_count' => (int) $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->prefix}sn_hr_commission_models"),
+			'users_by_role' => [
+				'sn_seller' => count(get_users(['role' => 'sn_seller', 'fields' => 'ID', 'number' => 5000])),
+				'sn_supervisor' => count(get_users(['role' => 'sn_supervisor', 'fields' => 'ID', 'number' => 5000])),
+				'sn_sales_manager' => count(get_users(['role' => 'sn_sales_manager', 'fields' => 'ID', 'number' => 5000])),
+			],
 		];
-		SN_Helpers::send_json(true, 'اطلاعات فنی', ['data' => $data]);
+		SN_Helpers::send_json(true, 'اطلاعات فنی', ['data' => $data, 'debug' => $this->sn_hr_debug_data('sn_hr_diagnostics')]);
 	}
 	public function ajax_hr_save_commission_model(): void
 	{
